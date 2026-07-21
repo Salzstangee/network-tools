@@ -5,6 +5,8 @@ Commands (type at the > prompt):
   add <ip|host|cidr> [...]      add targets; a CIDR (10.0.0.0/24) is scanned
                                 and only the reachable addresses are added
   del <ip|host|#> [...]         remove targets (by name or list number)
+  clear                         remove every target except the first one
+  clear all                     remove every target
   list                          show status table once
   watch                         live table, refreshes until you press Enter
   interval <sec>                change ping interval (default 5s)
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -27,11 +30,12 @@ INTERVAL = 1.0          # seconds between ping rounds
 TIMEOUT = 1             # seconds to wait for a reply
 SCAN_WORKERS = 64       # parallel pings while sweeping a network
 MAX_SCAN_HOSTS = 1024   # refuse to sweep anything bigger (/22)
+HISTORY = 30            # ping results kept per host for the loss graph
 STATE_FILE = os.path.expanduser("~/.pingmon_targets")
 
 IS_WINDOWS = platform.system().lower() == "windows"
 
-targets = {}            # host -> dict(up=None/True/False, rtt=str, since=datetime, checked=datetime)
+targets = {}            # host -> dict(up, rtt, since, checked, hist, sent, lost)
 lock = threading.Lock()
 stop = threading.Event()
 
@@ -79,6 +83,10 @@ def check(host):
         t["up"] = ok
         t["rtt"] = rtt
         t["checked"] = now
+        t["hist"].append(ok)
+        t["sent"] += 1
+        if not ok:
+            t["lost"] += 1
 
 
 def worker():
@@ -99,7 +107,8 @@ def add(host):
     with lock:
         if host in targets:
             return False
-        targets[host] = {"up": None, "rtt": "-", "since": None, "checked": None}
+        targets[host] = {"up": None, "rtt": "-", "since": None, "checked": None,
+                         "hist": deque(maxlen=HISTORY), "sent": 0, "lost": 0}
     threading.Thread(target=check, args=(host,), daemon=True).start()
     return True
 
@@ -166,6 +175,36 @@ def remove(key):
     return None
 
 
+def clear(keep_first=True):
+    """Drop every target, optionally keeping the first one. Returns how many went."""
+    with lock:
+        hosts = list(targets)
+        doomed = hosts[1:] if keep_first else hosts
+        for host in doomed:
+            del targets[host]
+    return len(doomed)
+
+
+def pct(lost, sent):
+    """Loss as a short string; never rounds a real loss down to 0%."""
+    if not sent:
+        return "-"
+    share = 100.0 * lost / sent
+    if lost and share < 1:
+        return "<1%"
+    return f"{share:.0f}%"
+
+
+def loss_pct(t):
+    return pct(t["lost"], t["sent"])
+
+
+def graph(hist):
+    """Right-aligned strip of the last HISTORY pings: green = reply, red = lost."""
+    bar = "".join("\033[32m█\033[0m" if ok else "\033[31m█\033[0m" for ok in hist)
+    return " " * (HISTORY - len(hist)) + bar
+
+
 def table():
     with lock:
         items = list(targets.items())
@@ -176,9 +215,12 @@ def table():
     width = max(width, 6)
     up = sum(1 for _, t in items if t["up"] is True)
     down = sum(1 for _, t in items if t["up"] is False)
+    sent = sum(t["sent"] for _, t in items)
+    lost = sum(t["lost"] for _, t in items)
 
-    lines = [f"{'#':>3}  {'HOST':<{width}}  {'STATUS':<9} {'RTT':>8}  SINCE",
-             "-" * (3 + 2 + width + 2 + 9 + 1 + 8 + 2 + 8)]
+    header = (f"{'#':>3}  {'HOST':<{width}}  {'STATUS':<9} {'RTT':>8}  "
+              f"{'LOSS':>5}  {'SINCE':<8}  LAST {HISTORY} PINGS")
+    lines = [header, "-" * len(header)]
     for i, (host, t) in enumerate(items, 1):
         if t["up"] is True:
             status = "\033[32m● UP\033[0m     "
@@ -187,10 +229,12 @@ def table():
         else:
             status = "\033[90m● ...\033[0m    "
         since = t["since"].strftime("%H:%M:%S") if t["since"] else "-"
-        lines.append(f"{i:>3}  {host:<{width}}  {status} {t['rtt']:>8}  {since}")
+        lines.append(f"{i:>3}  {host:<{width}}  {status} {t['rtt']:>8}  "
+                     f"{loss_pct(t):>5}  {since:<8}  {graph(t['hist'])}")
     lines.append("")
     lines.append(f"{len(items)} targets — {up} up, {down} down, "
                  f"{len(items) - up - down} unknown   "
+                 f"{lost}/{sent} pings lost ({pct(lost, sent)})   "
                  f"(interval {INTERVAL:g}s, {datetime.now():%H:%M:%S})")
     return "\n".join(lines) + "\n"
 
@@ -266,6 +310,14 @@ def main():
             for key in args:
                 gone = remove(key)
                 print(f"  removed {gone}" if gone else f"  no such target: {key}")
+            save()
+        elif cmd in ("clear", "c"):
+            keep_first = not (args and args[0].lower() == "all")
+            gone = clear(keep_first)
+            with lock:
+                left = list(targets)
+            print(f"  removed {gone} target{'s' if gone != 1 else ''}"
+                  + (f", kept {left[0]}" if keep_first and left else ""))
             save()
         elif cmd in ("list", "ls", "l"):
             print(table())

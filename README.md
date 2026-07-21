@@ -4,20 +4,25 @@ An interactive console ping monitor. Single file, Python 3 standard library only
 no dependencies to install.
 
 You add hosts at a prompt, a background thread pings them continuously, and a
-table shows who is up, who is down, the round-trip time, and — the useful bit —
-*since when* each host has been in its current state. Targets are remembered
-between runs.
+table shows who is up, who is down, the round-trip time, *since when* each host
+has been in its current state, and how many pings it has dropped. Targets are
+remembered between runs.
 
 ```
-  #  HOST            STATUS         RTT  SINCE
-------------------------------------------------
-  1  10.20.30.1      ● UP         0.4ms  09:12:03
-  2  10.20.30.14     ● UP         1.1ms  09:12:03
-  3  SWVIE0001       ● DOWN           -  09:41:57
-  4  8.8.8.8         ● UP        21.0ms  09:12:03
+  #  HOST            STATUS         RTT   LOSS  SINCE     LAST 30 PINGS
+-----------------------------------------------------------------------
+  1  10.20.30.1      ● UP         0.4ms     0%  09:12:03  ██████████████████████████████
+  2  10.20.30.14     ● UP         1.1ms     7%  09:12:03  ████████████████████▁▁████▁▁██
+  3  SWVIE0001       ● DOWN           -    41%  09:41:57  ██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+  4  8.8.8.8         ● UP        21.0ms    <1%  09:12:03  ██████████████████████████████
 
-4 targets — 3 up, 1 down, 0 unknown   (interval 1s, 09:44:12)
+4 targets — 3 up, 1 down, 0 unknown   37/1204 pings lost (3%)   (interval 1s, 09:44:12)
 ```
+
+The `LAST 30 PINGS` strip is the loss graph: one block per ping, green for a
+reply and red for a drop, newest at the right edge. A short drop that has since
+recovered stays visible for 30 rounds, which the STATUS column alone cannot
+show you.
 
 ## Requirements
 
@@ -50,6 +55,8 @@ Typed at the `>` prompt:
 |---|---|---|
 | `add <ip\|host\|cidr> [...]` | `a` | Add targets. CIDRs are swept — see below |
 | `del <ip\|host\|#> [...]` | `d`, `rm`, `remove` | Remove targets by name or by table number |
+| `clear` | `c` | Remove every target **except the first one** |
+| `clear all` | `c all` | Remove every target |
 | `list` | `l`, `ls` | Print the status table once |
 | `watch` | `w` | Live table, refreshing every second |
 | `interval <sec>` | | Change the ping interval (minimum 1s) |
@@ -120,6 +127,19 @@ Numbers refer to the table as printed at that moment. Deleting several by
 number in one command shifts the remaining numbers as it goes, so for multiple
 deletions either delete highest-number-first or just use the names.
 
+To empty the list instead, `clear` keeps target **#1** and drops the rest —
+handy when #1 is your reference host (a gateway or `8.8.8.8`) and everything
+else was a one-off sweep:
+
+```
+> clear
+  removed 6 targets, kept 10.20.30.1
+```
+
+`clear all` leaves nothing behind. Neither asks for confirmation and neither
+can be undone — the new list is saved immediately — but since the file is just
+a host list, re-adding is cheap.
+
 ## Persistence
 
 Targets are stored one per line in `~/.pingmon_targets`, written on every add,
@@ -134,8 +154,8 @@ Note that the file is **rewritten** whenever the target list changes, so any
 comments or blank lines you put there are dropped the first time you add or
 remove a host from inside the app.
 
-Only the host list is persisted — up/down state and the SINCE timestamps start
-fresh each run.
+Only the host list is persisted — up/down state, the SINCE timestamps, and the
+loss counters/graph all start fresh each run.
 
 ## Configuration
 
@@ -147,6 +167,7 @@ Constants at the top of `pingmon.py`:
 | `TIMEOUT` | `1` | Seconds to wait for a single reply |
 | `SCAN_WORKERS` | `64` | Parallel pings during a network sweep |
 | `MAX_SCAN_HOSTS` | `1024` | Largest network the sweep will accept |
+| `HISTORY` | `30` | Pings kept per host for the loss graph (= strip width) |
 | `STATE_FILE` | `~/.pingmon_targets` | Where the target list is saved |
 
 If you want to sweep bigger ranges, raising `SCAN_WORKERS` is the better knob —
@@ -164,12 +185,22 @@ sweep time scales with `hosts / workers`.
   address, so a `/22` does not spawn a thousand threads.
 - Status is colour-coded with ANSI escapes: green ● UP, red ● DOWN, grey ● …
   for a target that has not been checked yet.
+- Each target keeps a `deque(maxlen=HISTORY)` of results for the graph plus two
+  running totals for the LOSS column. The percentage is therefore over the whole
+  run, while the strip only covers the last `HISTORY` rounds — a host at `41%`
+  with an all-green strip has recovered from an earlier outage.
+- A non-zero loss never rounds down to `0%`; anything below one percent prints
+  as `<1%`.
 
 ## Limitations
 
 - ICMP only — no TCP-port or ARP-based discovery, so firewalled hosts look down.
 - IPv4-oriented in practice; IPv6 addresses work as plain targets, but sweeping
   an IPv6 prefix is not useful and will hit the size limit immediately.
-- No logging or alerting — state lives in memory and is lost on exit.
+- No logging or alerting — state lives in memory and is lost on exit, loss
+  counters included.
+- The loss graph adds 30 columns to the table; with long hostnames it wants a
+  terminal around 110 columns wide before it wraps. Lower `HISTORY` if that is
+  tight.
 - On most systems the unprivileged `ping` binary is used, so no raw-socket
   permissions are needed, but very locked-down images may not ship one.
