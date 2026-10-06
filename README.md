@@ -8,6 +8,8 @@ table shows who is up, who is down, the round-trip time, *since when* each host
 has been in its current state, and how many pings it has dropped. Targets are
 remembered between runs.
 
+![pingmon in the console](docs/pingmon-cli.png)
+
 ```
   #  HOST            STATUS         RTT   LOSS  SINCE     LAST 30 PINGS
 -----------------------------------------------------------------------
