@@ -12,15 +12,15 @@ remembered between runs.
   #  HOST            STATUS         RTT   LOSS  SINCE     LAST 30 PINGS
 -----------------------------------------------------------------------
   1  10.20.30.1      ● UP         0.4ms     0%  09:12:03  ██████████████████████████████
-  2  10.20.30.14     ● UP         1.1ms     7%  09:12:03  ████████████████████▁▁████▁▁██
-  3  SW01       ● DOWN           -    41%  09:41:57  ██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+  2  10.20.30.14     ● UP         1.1ms     7%  09:12:03  ████████████████████░░████░░██
+  3  SW01            ● DOWN           -    41%  09:41:57  ██████░░░░░░░░░░░░░░░░░░░░░░░░
   4  8.8.8.8         ● UP        21.0ms    <1%  09:12:03  ██████████████████████████████
 
 4 targets — 3 up, 1 down, 0 unknown   37/1204 pings lost (3%)   (interval 1s, 09:44:12)
 ```
 
 The `LAST 30 PINGS` strip is the loss graph: one block per ping, green for a
-reply and red for a drop, newest at the right edge. A short drop that has since
+reply and red for a drop (`░` above), newest at the right edge. A short drop that has since
 recovered stays visible for 30 rounds, which the STATUS column alone cannot
 show you.
 
