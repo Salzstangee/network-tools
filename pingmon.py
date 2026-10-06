@@ -42,16 +42,21 @@ stop = threading.Event()
 
 def ping(host):
     """Return (ok, rtt_ms_string)."""
+    extra = {}
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", str(TIMEOUT * 1000), host]
+        extra["creationflags"] = 0x08000000   # CREATE_NO_WINDOW: no console flash in the GUI
     else:
         cmd = ["ping", "-c", "1", "-W", str(TIMEOUT), host]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=TIMEOUT + 3)
+                             timeout=TIMEOUT + 3, **extra)
     except (subprocess.TimeoutExpired, OSError):
         return False, "-"
     if res.returncode != 0:
+        return False, "-"
+    # Windows exits 0 on "Destination host unreachable"; only a real echo reply has TTL=
+    if IS_WINDOWS and "TTL=" not in res.stdout.upper():
         return False, "-"
     # parse "time=12.3 ms" / "time<1ms" / German "Zeit=12ms"
     rtt = "-"

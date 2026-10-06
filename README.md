@@ -24,6 +24,19 @@ reply and red for a drop, newest at the right edge. A short drop that has since
 recovered stays visible for 30 rounds, which the STATUS column alone cannot
 show you.
 
+## Windows GUI
+
+`pingmon_gui.pyw` is a Win9x-style window around the same engine: target list,
+Task-Manager-style RTT graph for the selected host, event log of up/down
+changes, network sweep with progress bar, beep on outage, always-on-top. It
+shares `~/.pingmon_targets` with the console version, which stays as it is.
+
+- Run from source: `pythonw pingmon_gui.pyw` (Windows) or `python3 pingmon_gui.pyw`
+- `PingMon.exe`: built by GitHub Actions on every push to `main` (download it
+  from the run's artifacts), attached to the release when a `v*` tag is pushed.
+- Build locally on Windows:
+  `pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico pingmon_gui.pyw`
+
 ## Requirements
 
 - Python 3.6+ (no third-party packages)
