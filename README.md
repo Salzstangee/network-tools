@@ -26,6 +26,10 @@ show you.
 
 ## Windows GUI
 
+![PingMon for Windows](docs/pingmon-gui.png)
+
+Download: [PingMon.exe](https://github.com/Salzstangee/network-tools/releases/latest/download/PingMon.exe)
+
 `pingmon_gui.pyw` is a Win9x-style window around the same engine: target list,
 Task-Manager-style RTT graph for the selected host, event log of up/down
 changes, network sweep with progress bar, beep on outage, always-on-top. It
