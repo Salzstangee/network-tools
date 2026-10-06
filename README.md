@@ -8,14 +8,12 @@ table shows who is up, who is down, the round-trip time, *since when* each host
 has been in its current state, and how many pings it has dropped. Targets are
 remembered between runs.
 
-![pingmon in the console](docs/pingmon-cli.png)
-
 ```
   #  HOST            STATUS         RTT   LOSS  SINCE     LAST 30 PINGS
 -----------------------------------------------------------------------
   1  10.20.30.1      ● UP         0.4ms     0%  09:12:03  ██████████████████████████████
   2  10.20.30.14     ● UP         1.1ms     7%  09:12:03  ████████████████████▁▁████▁▁██
-  3  SWVIE0001       ● DOWN           -    41%  09:41:57  ██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+  3  SW01       ● DOWN           -    41%  09:41:57  ██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
   4  8.8.8.8         ● UP        21.0ms    <1%  09:12:03  ██████████████████████████████
 
 4 targets — 3 up, 1 down, 0 unknown   37/1204 pings lost (3%)   (interval 1s, 09:44:12)
@@ -93,9 +91,9 @@ and saves.
 Arguments are space-separated, and you can mix forms freely:
 
 ```
-> add 10.20.30.1 SWVIE0001 8.8.8.8
+> add 10.20.30.1 SW01 8.8.8.8
   added 10.20.30.1
-  added SWVIE0001
+  added SW01
   added 8.8.8.8
 ```
 
@@ -139,7 +137,7 @@ Details worth knowing:
 By name, or by the number in the table:
 
 ```
-> del 3 SWVIE0001
+> del 3 SW01
 ```
 
 Numbers refer to the table as printed at that moment. Deleting several by
@@ -166,7 +164,7 @@ delete, and exit, and read back at startup. Lines starting with `#` are ignored
 on read, which makes bulk-loading easy:
 
 ```bash
-printf '10.20.30.1\n10.20.30.2\nSWVIE0001\n' >> ~/.pingmon_targets
+printf '10.20.30.1\n10.20.30.2\nSW01\n' >> ~/.pingmon_targets
 ```
 
 Note that the file is **rewritten** whenever the target list changes, so any
