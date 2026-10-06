@@ -46,11 +46,13 @@ def ping(host):
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", str(TIMEOUT * 1000), host]
         extra["creationflags"] = 0x08000000   # CREATE_NO_WINDOW: no console flash in the GUI
+        extra["encoding"] = "oem"             # ping writes the console codepage (cp850: "ausgeführt")
     else:
         cmd = ["ping", "-c", "1", "-W", str(TIMEOUT), host]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=TIMEOUT + 3, **extra)
+        # stdin=DEVNULL: a windowed exe has no valid stdin handle to inherit
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, errors="replace", timeout=TIMEOUT + 3, **extra)
     except (subprocess.TimeoutExpired, OSError):
         return False, "-"
     if res.returncode != 0:
