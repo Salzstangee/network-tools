@@ -1,7 +1,15 @@
 # pingmon
 
-An interactive console ping monitor. Single file, Python 3 standard library only,
-no dependencies to install.
+A ping monitor in two versions that share one engine and one target list:
+
+| Version | File | Start |
+|---|---|---|
+| **Console (CLI)**: Linux, macOS, WSL, Windows | `pingmon.py` | `python3 pingmon.py` |
+| **Windows (GUI)**: Win9x-style window | `pingmon_gui.pyw` | [PingMon.exe](https://github.com/Salzstangee/network-tools/releases/latest/download/PingMon.exe), no Python needed |
+
+Both are Python 3 standard library only, no dependencies to install.
+
+## Console version (CLI)
 
 You add hosts at a prompt, a background thread pings them continuously, and a
 table shows who is up, who is down, the round-trip time, *since when* each host
@@ -24,13 +32,14 @@ reply and red for a drop (`░` above), newest at the right edge. A short drop t
 recovered stays visible for 30 rounds, which the STATUS column alone cannot
 show you.
 
-## Windows GUI
+## Windows version (GUI)
 
 ![PingMon for Windows](docs/pingmon-gui.png)
 
 Download: [PingMon.exe](https://github.com/Salzstangee/network-tools/releases/latest/download/PingMon.exe)
+(single file, no install, no Python needed)
 
-`pingmon_gui.pyw` is a Win9x-style window around the same engine: target list,
+`pingmon_gui.pyw` is a Win9x-style window around the same engine as the CLI: target list,
 Task-Manager-style RTT graph for the selected host, event log of up/down
 changes, network sweep with progress bar, beep on outage, always-on-top. It
 shares `~/.pingmon_targets` with the console version, which stays as it is.
@@ -40,6 +49,11 @@ shares `~/.pingmon_targets` with the console version, which stays as it is.
   from the run's artifacts), attached to the release when a `v*` tag is pushed.
 - Build locally on Windows:
   `pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico pingmon_gui.pyw`
+
+---
+
+The sections below describe the **console version**. Persistence,
+configuration and "How it works" apply to both versions.
 
 ## Requirements
 
