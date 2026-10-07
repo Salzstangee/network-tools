@@ -17,8 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico pingmon_gui.pyw
+      - run: pip install pyinstaller pystray pillow
+      - run: pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico --hidden-import pystray._win32 pingmon_gui.pyw
       - uses: actions/upload-artifact@v4
         with:
           name: PingMon

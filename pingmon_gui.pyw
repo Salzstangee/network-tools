@@ -2,11 +2,15 @@
 """PingMon for Windows - a Win9x-style GUI on top of pingmon.py.
 
 Same engine, same target file (~/.pingmon_targets) as the console version;
-only the front end differs. Standard library only (tkinter).
+only the front end differs. tkinter only; the tray icon additionally needs
+pystray + pillow (bundled into PingMon.exe) and is simply left out without them.
 """
 
 import ipaddress
+import json
 import os
+import queue
+import socket
 import sys
 import threading
 import time
@@ -19,10 +23,23 @@ from tkinter import filedialog, messagebox
 
 import pingmon as core
 
+try:
+    import pystray
+    from PIL import Image
+except Exception:       # not installed, or no usable tray backend (pystray raises ValueError)
+    pystray = None
+
 APP = "PingMon"
-VERSION = "1.0"
+VERSION = "1.1"
+IS_WINDOWS = sys.platform == "win32"
+SETTINGS_FILE = os.path.expanduser("~/.pingmon_settings.json")
+INSTANCE_PORT = 47231   # loopback port that keeps PingMon single-instance
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+DEFAULTS = {"autostart": False, "start_minimized": True, "close_to_tray": False,
+            "notify": True, "interval": 1.0, "beep": False, "on_top": False}
 REFRESH_MS = 250        # UI poll rate
-GRAPH_POINTS = 120      # RTT samples kept per host for the history graph
+GRAPH_POINTS = 600      # samples kept per host (feeds the graph and the wide loss strip)
+GRAPH_WINDOW = 300      # samples the RTT graph spreads across its full width
 LOG_LINES = 500         # event log length
 
 # Win9x system palette
@@ -203,6 +220,91 @@ def bevel(canvas, x0, y0, x1, y1, sunken=False):
         canvas.create_line(x0 + 1, y1 - 2, x1 - 2, y1 - 2, x1 - 2, y0 + 1, fill=SHADOW)
 
 
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as fh:
+            return {**DEFAULTS, **json.load(fh)}
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w") as fh:
+            json.dump(settings, fh, indent=2)
+    except OSError:
+        pass
+
+
+def launch_command():
+    """What the Run key starts: the exe itself, or pythonw + this script from source."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --autostart'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    exe = pyw if os.path.exists(pyw) else sys.executable
+    return f'"{exe}" "{os.path.abspath(sys.argv[0])}" --autostart'
+
+
+def autostart_get():
+    """Current HKCU Run entry for PingMon, or None (also None off Windows)."""
+    if not IS_WINDOWS:
+        return None
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            return winreg.QueryValueEx(key, APP)[0]
+    except OSError:
+        return None
+
+
+def autostart_set(on):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if on:
+            winreg.SetValueEx(key, APP, 0, winreg.REG_SZ, launch_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP)
+            except FileNotFoundError:
+                pass
+
+
+def claim_instance():
+    """Listen on a loopback port; if another PingMon holds it, ask that one to show itself.
+
+    Returns the listening socket, or None when an existing PingMon answered.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", INSTANCE_PORT))
+        srv.listen(2)
+        return srv
+    except OSError:
+        srv.close()
+    try:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=2) as c:
+            c.sendall(b"pingmon-show\n")
+            if c.recv(16).startswith(b"ok"):
+                return None
+    except OSError:
+        pass
+    return False    # port taken by something else: run without the single-instance guard
+
+
+def tray_image(alert):
+    """The app icon for the tray; the screen turns red while any host is down."""
+    pal = dict(PALETTE)
+    if alert:
+        pal.update(d="#800000", G="#ff4040")
+    img = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+    for y, row in enumerate(ICONS["app"]):
+        for x, ch in enumerate(row):
+            if ch != ".":
+                h = pal[ch]
+                img.putpixel((x, y), (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16), 255))
+    return img.resize((64, 64), Image.NEAREST)
+
+
 class ToolButton(tk.Label):
     """Flat toolbar button that pops up on hover and sinks on click (IE4 style)."""
 
@@ -373,8 +475,13 @@ class AboutDialog(Dialog):
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, server=None):
         self.root = root
+        self.settings = load_settings()
+        self.events = queue.Queue()     # tray and second-instance requests, handled in tick()
+        self.tray = None
+        self.tray_state = None
+        self.told_tray = False
         self.selected = None
         self.samples = {}           # host -> deque of (up, rtt_ms)
         self.last_checked = {}      # host -> datetime of the last sample taken
@@ -402,9 +509,18 @@ class App:
         self.big_icon = make_icon("app", 2)
         root.iconphoto(True, self.big_icon, self.icons["app"])
 
+        st = self.settings
+        core.INTERVAL = float(st["interval"])
+        if IS_WINDOWS:   # the registry is the truth: Task Manager can remove the entry too
+            st["autostart"] = autostart_get() is not None
         self.interval = tk.DoubleVar(value=core.INTERVAL)
-        self.on_top = tk.BooleanVar(value=False)
-        self.beep = tk.BooleanVar(value=False)
+        self.on_top = tk.BooleanVar(value=st["on_top"])
+        self.beep = tk.BooleanVar(value=st["beep"])
+        self.v_autostart = tk.BooleanVar(value=st["autostart"])
+        self.v_minimized = tk.BooleanVar(value=st["start_minimized"])
+        self.v_close_tray = tk.BooleanVar(value=st["close_to_tray"])
+        self.v_notify = tk.BooleanVar(value=st["notify"])
+        root.attributes("-topmost", self.on_top.get())
 
         self.build_menu()
         self.build_toolbar()
@@ -415,7 +531,16 @@ class App:
         core.load()
         threading.Thread(target=core.worker, daemon=True).start()
         self.log(f"{APP} {VERSION} started, {len(core.targets)} target(s) loaded", AMBER)
-        root.protocol("WM_DELETE_WINDOW", self.quit)
+        self.server = server
+        if server:
+            threading.Thread(target=self.listen, daemon=True).start()
+        self.start_tray()
+        if st["autostart"] and autostart_get() != launch_command():
+            autostart_set(True)     # exe was moved: point the Run entry at the new path
+            self.log("autostart entry updated to this program's location", AMBER)
+        if "--autostart" in sys.argv and st["start_minimized"] and self.tray:
+            root.withdraw()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
 
     # ---- layout --------------------------------------------------------
@@ -453,11 +578,29 @@ class App:
         v.add_cascade(label="Ping Interval", underline=0, menu=iv)
         v.add_separator()
         v.add_checkbutton(label="Always on Top", underline=0, variable=self.on_top,
-                          command=lambda: self.root.attributes("-topmost", self.on_top.get()))
-        v.add_checkbutton(label="Beep on Host Down", underline=0, variable=self.beep)
+                          command=self.apply_top)
+        v.add_checkbutton(label="Beep on Host Down", underline=0, variable=self.beep,
+                          command=self.persist)
         v.add_separator()
         v.add_command(label="Clear Event Log", underline=6, command=self.clear_log)
         m.add_cascade(label="View", underline=0, menu=v)
+
+        st = tk.Menu(m)
+        tray = "normal" if pystray else "disabled"
+        st.add_checkbutton(label="Start with Windows", underline=0, variable=self.v_autostart,
+                           command=self.toggle_autostart,
+                           state="normal" if IS_WINDOWS else "disabled")
+        st.add_checkbutton(label="Start Minimized to Tray", underline=6,
+                           variable=self.v_minimized, command=self.persist, state=tray)
+        st.add_separator()
+        st.add_checkbutton(label="Close to Tray (keep running)", underline=0,
+                           variable=self.v_close_tray, command=self.persist, state=tray)
+        st.add_checkbutton(label="Tray Notification on Host Down", underline=0,
+                           variable=self.v_notify, command=self.persist, state=tray)
+        if not pystray:
+            st.add_separator()
+            st.add_command(label="(tray needs: pip install pystray pillow)", state="disabled")
+        m.add_cascade(label="Settings", underline=0, menu=st)
 
         h = tk.Menu(m)
         h.add_command(label=f"About {APP}...", underline=0, command=lambda: AboutDialog(self))
@@ -536,7 +679,7 @@ class App:
         self.logbox.configure(yscrollcommand=lsb.set)
         lsb.pack(side="right", fill="y")
         self.logbox.pack(side="left", fill="both", expand=True)
-        pane.add(bottom, minsize=110, height=200)
+        pane.add(bottom, minsize=110, height=200, stretch="always")
 
     def build_statusbar(self):
         bar = tk.Frame(self.root, bg=FACE)
@@ -662,11 +805,103 @@ class App:
     def set_interval(self):
         core.INTERVAL = self.interval.get()
         self.log(f"ping interval set to {core.INTERVAL:g}s", AMBER)
+        self.persist()
+
+    def apply_top(self):
+        self.root.attributes("-topmost", self.on_top.get())
+        self.persist()
 
     def toggle_top(self):
         self.on_top.set(not self.on_top.get())
-        self.root.attributes("-topmost", self.on_top.get())
+        self.apply_top()
         self.flash("Always on top " + ("ON." if self.on_top.get() else "OFF."))
+
+    def persist(self):
+        self.settings.update(interval=core.INTERVAL, on_top=self.on_top.get(),
+                             beep=self.beep.get(), autostart=self.v_autostart.get(),
+                             start_minimized=self.v_minimized.get(),
+                             close_to_tray=self.v_close_tray.get(), notify=self.v_notify.get())
+        save_settings(self.settings)
+
+    def toggle_autostart(self):
+        on = self.v_autostart.get()
+        where = sys.executable.lower()
+        if on and getattr(sys, "frozen", False) and ("\\downloads\\" in where or "\\temp\\" in where):
+            if not messagebox.askyesno(
+                    APP, f"PingMon is running from\n{sys.executable}\n\n"
+                         "Autostart will point to exactly this file. If you move or delete it "
+                         "later, autostart stops working.\n\n"
+                         "Better: move PingMon.exe to a fixed folder first "
+                         "(e.g. %LOCALAPPDATA%\\PingMon).\n\nEnable autostart anyway?",
+                    parent=self.root):
+                self.v_autostart.set(False)
+                return
+        try:
+            autostart_set(on)
+        except OSError as e:
+            messagebox.showerror(APP, f"Could not change autostart:\n{e}", parent=self.root)
+            self.v_autostart.set(autostart_get() is not None)
+            return
+        self.log("start with Windows " + ("enabled" if on else "disabled"), AMBER)
+        self.persist()
+
+    # ---- tray / window ---------------------------------------------------
+
+    def start_tray(self):
+        if not pystray:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem(f"Open {APP}", lambda: self.events.put("show"), default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", lambda: self.events.put("quit")))
+        try:
+            self.tray = pystray.Icon(APP, tray_image(False), APP, menu)
+            self.tray.run_detached()
+        except Exception as e:      # no tray on this desktop: the window just behaves normally
+            self.tray = None
+            self.log(f"no system tray available ({e.__class__.__name__})", GREY)
+
+    def notify(self, msg):
+        if self.tray and self.v_notify.get() and getattr(self.tray, "HAS_NOTIFICATION", False):
+            try:
+                self.tray.notify(msg, APP)
+            except Exception:
+                pass
+
+    def listen(self):
+        """Second-instance requests: answer and bring this window up."""
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    if conn.recv(32).startswith(b"pingmon-show"):
+                        conn.sendall(b"ok")
+                        self.events.put("show")
+                except OSError:
+                    pass
+
+    def on_close(self):
+        if self.tray and self.v_close_tray.get():
+            self.root.withdraw()
+            if not self.told_tray:
+                self.told_tray = True
+                if getattr(self.tray, "HAS_NOTIFICATION", False):
+                    self.tray.notify(f"{APP} keeps monitoring in the background. "
+                                     "Right-click the tray icon to exit.", APP)
+        else:
+            self.quit()
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        self.root.attributes("-topmost", True)      # Windows won't raise a window otherwise
+        self.root.after(200, lambda: self.root.attributes("-topmost", self.on_top.get()))
+        self.root.focus_force()
 
     def import_targets(self):
         path = filedialog.askopenfilename(parent=self.root, title="Import Targets",
@@ -697,6 +932,14 @@ class App:
     def quit(self):
         core.stop.set()
         core.save()
+        self.persist()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+        if self.server:
+            self.server.close()
         self.root.destroy()
 
     # ---- list interaction ----------------------------------------------
@@ -752,6 +995,13 @@ class App:
     # ---- periodic refresh ----------------------------------------------
 
     def tick(self):
+        while not self.events.empty():
+            ev = self.events.get_nowait()
+            if ev == "quit":
+                self.quit()
+                return
+            if ev == "show":
+                self.show_window()
         with core.lock:
             items = [(h, dict(t, hist=list(t["hist"]))) for h, t in core.targets.items()]
         live = {h for h, _ in items}
@@ -770,8 +1020,10 @@ class App:
                 if prev is not None:
                     if t["up"]:
                         self.log(f"{host:<16} UP    (rtt {t['rtt']})", GREEN)
+                        self.notify(f"{host} is back UP ({t['rtt']})")
                     else:
                         self.log(f"{host:<16} DOWN  ** no reply **", RED)
+                        self.notify(f"{host} is DOWN - no reply")
                         if self.beep.get():
                             self.root.bell()
                 elif not t["up"]:
@@ -781,8 +1033,9 @@ class App:
         if self.selected not in live:
             self.selected = items[0][0] if items else None
         self.items = items
-        self.draw_list()
-        self.draw_graph()
+        if self.root.state() != "withdrawn":    # hidden in the tray: only the status matters
+            self.draw_list()
+            self.draw_graph()
         self.update_status()
         self.root.after(REFRESH_MS, self.tick)
 
@@ -805,6 +1058,10 @@ class App:
         if down:
             title += f" - {down} DOWN"
         self.root.title(title)
+        if self.tray and (bool(down), title) != self.tray_state:
+            self.tray_state = (bool(down), title)
+            self.tray.icon = tray_image(bool(down))
+            self.tray.title = title
 
     def draw_list(self):
         c = self.list
@@ -820,8 +1077,12 @@ class App:
         hostw = max([len(h) for h in self.rows] + [16])
         cols = [("#", 4 * cw, "e"), ("Host", (hostw + 2) * cw, "w"),
                 ("Status", 9 * cw, "w"), ("RTT", 9 * cw, "e"), ("Loss", 7 * cw, "e"),
-                ("Since", 11 * cw, "w"), (f"Last {core.HISTORY} pings",
-                                          core.HISTORY * (cw - 1) + 2 * cw, "w")]
+                ("Since", 11 * cw, "w")]
+        # the loss strip takes whatever width is left, so a bigger window shows more pings
+        cell = cw - 1
+        fixed = sum(w for _, w, _ in cols) + 4
+        slots = max(core.HISTORY, min(GRAPH_POINTS, (c.winfo_width() - fixed - 2 * cw) // cell))
+        cols.append((f"Last {slots} pings", slots * cell + 2 * cw, "w"))
         width = max(c.winfo_width(), sum(w for _, w, _ in cols) + 8)
 
         y = self.header_h
@@ -851,12 +1112,13 @@ class App:
                 c.create_text(tx, mid, text=val, anchor=anchor, font=f, fill=fg)
                 x += w
             # loss strip: one cell per ping, newest on the right
-            hist = t["hist"]
-            x += (core.HISTORY - len(hist)) * (cw - 1)
+            seen = self.samples.get(host)
+            hist = [up for up, _ in seen][-slots:] if seen else t["hist"]
+            x += (slots - len(hist)) * cell
             for ok in hist:
                 c.create_rectangle(x, top + 3, x + cw - 3, bot - 4,
                                    fill=DIMGREEN if ok else RED, outline="")
-                x += cw - 1
+                x += cell
 
         if not items:
             c.create_text(20, self.header_h + 20, anchor="w", font=f, fill=DIMGREEN,
@@ -885,18 +1147,19 @@ class App:
         host = self.selected
         self.graph_box.config(text=f" RTT History - {host} " if host else " RTT History ")
         step = 12
+        # the last GRAPH_WINDOW samples always span the full width, whatever the window size
+        dx = (w - 4) / (GRAPH_WINDOW - 1)
         # Task-Manager style: the grid scrolls left with every sample
-        shift = (self.counts.get(host, 0) * 4) % step
+        shift = int(self.counts.get(host, 0) * dx) % step
         for gx in range(w - shift, -1, -step):
             g.create_line(gx, 0, gx, h, fill=GRID)
         for gy in range(h, -1, -step):
             g.create_line(0, gy, w, gy, fill=GRID)
         if not host:
             return
-        pts = list(self.samples.get(host, ()))
+        pts = list(self.samples.get(host, ()))[-GRAPH_WINDOW:]
         values = [v for up, v in pts if up and v is not None]
         top = max(values + [10.0]) * 1.25
-        dx = 4
         poly = []
         for i, (up, v) in enumerate(reversed(pts)):
             x = w - 2 - i * dx
@@ -905,7 +1168,8 @@ class App:
             if up:
                 poly.append((x, h - 2 - (v / top) * (h - 14)))
             else:
-                g.create_rectangle(x - 1, 0, x + 1, h, fill=DIMRED, outline="")
+                g.create_rectangle(x - max(1, dx / 2), 0, x + max(1, dx / 2), h,
+                                   fill=DIMRED, outline="")
                 if len(poly) > 1:
                     g.create_line(*[c for p in poly for c in p], fill=GREEN)
                 poly = []
@@ -930,9 +1194,13 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
+    server = claim_instance()
+    if server is None:      # an existing PingMon was asked to show itself
+        return
     root = tk.Tk()
-    App(root)
+    App(root, server or None)
     root.mainloop()
+    os._exit(0)     # never linger as an invisible process if the tray thread hangs
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ A ping monitor in two versions that share one engine and one target list:
 | **Console (CLI)**: Linux, macOS, WSL, Windows | `pingmon.py` | `python3 pingmon.py` |
 | **Windows (GUI)**: Win9x-style window | `pingmon_gui.pyw` | [PingMon.exe](https://github.com/Salzstangee/network-tools/releases/latest/download/PingMon.exe), no Python needed |
 
-Both are Python 3 standard library only, no dependencies to install.
+The CLI is Python 3 standard library only; the exe has everything bundled.
 
 ## Console version (CLI)
 
@@ -44,11 +44,24 @@ Task-Manager-style RTT graph for the selected host, event log of up/down
 changes, network sweep with progress bar, beep on outage, always-on-top. It
 shares `~/.pingmon_targets` with the console version, which stays as it is.
 
-- Run from source: `pythonw pingmon_gui.pyw` (Windows) or `python3 pingmon_gui.pyw`
+**Settings** menu (GUI only): *Start with Windows* (per-user `HKCU\...\Run` entry,
+no admin), *Start Minimized to Tray*, *Close to Tray* (keeps monitoring in the
+background) and *Tray Notification on Host Down*. The tray icon turns red while
+a host is down; click it to open the window, right-click for Exit. Settings are
+kept in `~/.pingmon_settings.json`. Starting PingMon a second time just brings
+the running one to the front.
+
+Put `PingMon.exe` in a fixed folder (e.g. `%LOCALAPPDATA%\PingMon`) before
+enabling autostart, since the Run entry points at that exact path. On Windows 11
+new tray icons sit behind the `^` arrow until you drag them out once.
+
+- Run from source: `pythonw pingmon_gui.pyw` (Windows) or `python3 pingmon_gui.pyw`;
+  the tray needs `pip install pystray pillow`, everything else is standard library
 - `PingMon.exe`: built by GitHub Actions on every push to `main` (download it
   from the run's artifacts), attached to the release when a `v*` tag is pushed.
 - Build locally on Windows:
-  `pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico pingmon_gui.pyw`
+  `pip install pyinstaller pystray pillow`, then
+  `pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico --hidden-import pystray._win32 pingmon_gui.pyw`
 
 ---
 
