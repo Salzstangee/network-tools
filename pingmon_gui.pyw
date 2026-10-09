@@ -10,8 +10,10 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,7 +37,7 @@ except Exception:       # not installed, or no usable tray backend (pystray rais
     pystray = None
 
 APP = "PingMon"
-VERSION = "1.4"
+VERSION = "1.5"
 IS_WINDOWS = sys.platform == "win32"
 REPO = "https://github.com/Salzstangee/network-tools"
 SELF_UPDATE = IS_WINDOWS and getattr(sys, "frozen", False)    # only the exe can swap itself
@@ -747,38 +749,46 @@ def ttl_guess(ttl):
     return ""
 
 
-class HostInfo(tk.Toplevel):
-    """Host Info window: DNS both ways, echo reply, what the monitor saw, trace route."""
+HOP_ADDR = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}")
 
-    def __init__(self, app, target):
-        super().__init__(app.root, bg=FACE)
-        self.app, self.target = app, target
-        self.host, self.port = core.split_port(target)
-        self.lines = queue.Queue()      # (segments) from the worker, None when a job is done
-        self.cancel = threading.Event()
-        self.proc = None
-        self.busy = False
-        self.sections = 0
-        self.title(f"Host Info - {target}")
-        self.transient(app.root)    # stays above an always-on-top PingMon, hides with it
-        self.geometry("760x500")
-        self.minsize(480, 300)
-        self.protocol("WM_DELETE_WINDOW", self.close)
-        self.bind("<Escape>", lambda e: self.close())
 
-        head = tk.Frame(self, bg=FACE, padx=10, pady=8)
-        head.pack(fill="x")
-        tk.Label(head, image=app.icons["lookup"], bg=FACE).pack(side="left", padx=(0, 8))
-        tk.Label(head, text=target, bg=FACE, font=app.ui_bold).pack(side="left")
+def next_hop(addr):
+    """Gateway that packets to an IPv4 address leave through, or None for a directly
+    connected network. Read from the routing table; nothing is sent."""
+    if IS_WINDOWS:
+        import ctypes
 
-        btns = tk.Frame(self, bg=FACE, padx=10)
-        self.status = tk.Label(self, text="", bg=FACE, bd=1, relief="sunken", anchor="w", padx=3)
-        self.status.pack(side="bottom", fill="x", padx=2, pady=(0, 2))
-        btns.pack(side="bottom", fill="x", pady=8)
-        wrap = tk.Frame(self, bd=2, relief="sunken")
-        wrap.pack(fill="both", expand=True, padx=10)
+        class Row(ctypes.Structure):    # MIB_IPFORWARDROW
+            _fields_ = [(n, ctypes.c_ulong) for n in (
+                "dest", "mask", "policy", "next_hop", "if_index", "type", "proto", "age",
+                "next_hop_as", "m1", "m2", "m3", "m4", "m5")]
+        row = Row()
+        dest = struct.unpack("<L", socket.inet_aton(addr))[0]
+        err = ctypes.windll.iphlpapi.GetBestRoute(ctypes.c_ulong(dest), ctypes.c_ulong(0),
+                                                  ctypes.byref(row))
+        if err:
+            raise OSError(err, "no route")
+        if row.type == 3 or row.next_hop in (0, dest):     # 3 = MIB_IPROUTE_TYPE_DIRECT
+            return None
+        return socket.inet_ntoa(struct.pack("<L", row.next_hop))
+    out = subprocess.run(["ip", "-o", "route", "get", addr], capture_output=True, text=True,
+                         timeout=3).stdout
+    if not out:
+        raise OSError("no route")
+    via = re.search(r"\bvia (\S+)", out)
+    return via.group(1) if via else None
+
+
+class Console:
+    """One phosphor output pane of the Host Info window, written to from a worker thread."""
+
+    def __init__(self, parent, app, title):
+        self.title = title
+        self.box = tk.LabelFrame(parent, text=f" {title} ", bg=FACE, bd=2, relief="groove")
+        wrap = tk.Frame(self.box, bd=2, relief="sunken")
+        wrap.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         self.text = tk.Text(wrap, bg=SCREEN, fg=GREEN, font=app.mono, bd=0, padx=6, pady=4,
-                            highlightthickness=0, wrap="none", cursor="arrow")
+                            highlightthickness=0, wrap="none", cursor="arrow", height=6)
         sb = tk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -787,200 +797,328 @@ class HostInfo(tk.Toplevel):
                             ("warn", AMBER), ("bad", RED)):
             self.text.tag_configure(tag, foreground=colour)
         self.text.configure(state="disabled")
+        self.text.tag_configure("dim", foreground=DIMGREEN)
+        self.lines = queue.Queue()      # ("line", segs, key) / ("append", key, text) / ("status", text)
+        self.busy = False               # ... and None when the job ends
+        self.sections = 0
+
+    def start(self, status, job, *args):
+        """Clear the pane and run job(*args) in a thread."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        for mark in self.text.mark_names():
+            if mark.startswith("line:"):
+                self.text.mark_unset(mark)
+        self.text.configure(state="disabled")
+        self.busy, self.sections = True, 0
+        self.box.config(text=f" {self.title} - {status} ")
+        threading.Thread(target=self.work, args=(job, args), daemon=True).start()
+
+    def work(self, job, args):
+        try:
+            job(*args)
+        except Exception as e:      # a lookup gone wrong must not leave the pane stuck
+            self.out(f"error: {e}", "bad")
+        self.lines.put(None)
+
+    def drain(self):
+        """Move queued output into the pane (UI thread)."""
+        wrote = False
+        while not self.lines.empty():
+            item = self.lines.get_nowait()
+            if item is None:
+                self.busy = False
+                self.box.config(text=f" {self.title} ")
+                continue
+            if item[0] == "status":
+                self.box.config(text=f" {self.title} - {item[1]} ")
+                continue
+            if not wrote:
+                self.text.configure(state="normal")
+                wrote = True
+            if item[0] == "append":         # e.g. a hop's DNS name that arrived later
+                mark = f"line:{item[1]}"
+                if mark in self.text.mark_names():
+                    self.text.insert(mark, item[2], "dim")
+                continue
+            _, segs, key = item
+            for text, tag in segs:
+                self.text.insert("end", text, tag)
+            if key:
+                self.text.mark_set(f"line:{key}", "end-1c")
+                self.text.mark_gravity(f"line:{key}", "left")
+            self.text.insert("end", "\n")
+        if wrote:
+            self.text.see("end")
+            self.text.configure(state="disabled")
+
+    def status(self, text):
+        self.lines.put(("status", text))
+
+    def out(self, text, tag="val", key=None):
+        self.lines.put(("line", [(text, tag)], key))
+
+    def append(self, key, text):
+        self.lines.put(("append", key, text))
+
+    def kv(self, key, value, tag="val"):
+        self.lines.put(("line", [(f"{key} ".ljust(19, "."), "key"), (f" {value}", tag)], None))
+
+    def section(self, title):
+        if self.sections:
+            self.out("")        # blank line between sections, not above the first
+        self.sections += 1
+        self.out(f"== {title} ".ljust(64, "="), "head")
+
+
+class HostInfo(tk.Toplevel):
+    """Host Info window: where the pings go, DNS, what the monitor saw; a trace route beside it."""
+
+    DEAD_HOPS = 3       # the trace gives up after this many silent hops in a row
+
+    def __init__(self, app, target):
+        super().__init__(app.root, bg=FACE)
+        self.app, self.target = app, target
+        self.host, self.port = core.split_port(target)
+        self.proc = None
+        self.trace_stop = threading.Event()
+        self.namer = ThreadPoolExecutor(max_workers=4)     # hop names, resolved beside the trace
+        self.title(f"Host Info - {target}")
+        self.transient(app.root)    # stays above an always-on-top PingMon, hides with it
+        self.geometry("780x640")
+        self.minsize(480, 360)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+
+        head = tk.Frame(self, bg=FACE, padx=10, pady=6)
+        head.pack(fill="x")
+        tk.Label(head, image=app.icons["lookup"], bg=FACE).pack(side="left", padx=(0, 8))
+        tk.Label(head, text=target, bg=FACE, font=app.ui_bold).pack(side="left")
+        self.note = tk.Label(head, text="", bg=FACE, fg=SHADOW)
+        self.note.pack(side="right")
+
+        btns = tk.Frame(self, bg=FACE, padx=10)
+        btns.pack(side="bottom", fill="x", pady=8)
+        pane = tk.PanedWindow(self, orient="vertical", bg=FACE, bd=0, sashwidth=6,
+                              sashrelief="raised")
+        pane.pack(fill="both", expand=True, padx=8)
+        self.info = Console(pane, app, "Host Info")
+        self.route = Console(pane, app, "Trace Route")
+        pane.add(self.info.box, minsize=120, height=330, stretch="always")
+        pane.add(self.route.box, minsize=100, stretch="always")
 
         def button(text, cmd, side="left"):
             b = tk.Button(btns, text=text, width=12, bg=FACE, activebackground=FACE, command=cmd)
             b.pack(side=side, padx=(0, 6) if side == "left" else (6, 0))
             return b
         self.b_refresh = button("Refresh", self.refresh)
-        self.b_trace = button("Trace Route", self.trace)
-        self.b_stop = button("Stop", self.stop)
+        self.b_trace = button("Trace Route", self.toggle_trace)
         button("Close", self.close, "right")
         button("Copy All", self.copy, "right")
         self.refresh()
+        self.trace()
         self.poll()
-
-    # ---- job plumbing ----------------------------------------------------
-
-    def run(self, status, job, *args):
-        if self.busy:
-            return
-        self.busy = True
-        self.cancel.clear()
-        self.status.config(text=status)
-        for b, on in ((self.b_refresh, False), (self.b_trace, False), (self.b_stop, True)):
-            b.config(state="normal" if on else "disabled")
-        threading.Thread(target=self.work, args=(job, args), daemon=True).start()
-
-    def work(self, job, args):
-        try:
-            job(*args)
-        except Exception as e:      # a lookup gone wrong must not leave the window stuck
-            self.out(f"error: {e}", "bad")
-        self.lines.put(None)
 
     def poll(self):
         if not self.winfo_exists():
             return
-        changed = False
-        while not self.lines.empty():
-            segs = self.lines.get_nowait()
-            if segs is None:
-                self.busy = False
-                self.status.config(text="Ready")
-                for b, on in ((self.b_refresh, True), (self.b_trace, True), (self.b_stop, False)):
-                    b.config(state="normal" if on else "disabled")
-                continue
-            if not changed:
-                self.text.configure(state="normal")
-                changed = True
-            for text, tag in segs:
-                self.text.insert("end", text, tag)
-            self.text.insert("end", "\n")
-        if changed:
-            self.text.see("end")
-            self.text.configure(state="disabled")
+        self.info.drain()
+        self.route.drain()
+        self.b_refresh.config(state="disabled" if self.info.busy else "normal")
+        self.b_trace.config(text="Stop Trace" if self.route.busy else "Trace Route")
         self.after(80, self.poll)
-
-    def out(self, text, tag="val"):
-        self.lines.put([(text, tag)])
-
-    def kv(self, key, value, tag="val"):
-        self.lines.put([(f"{key} ".ljust(19, "."), "key"), (f" {value}", tag)])
-
-    def section(self, title):
-        if self.sections:
-            self.lines.put([])      # blank line between sections, not above the first
-        self.sections += 1
-        self.lines.put([(f"== {title} ".ljust(64, "="), "head")])
 
     # ---- buttons ---------------------------------------------------------
 
     def refresh(self):
-        self.run("Looking up...", self.general, self.app.host_stats(self.target))
+        if not self.info.busy:
+            self.info.start("looking up...", self.general, self.app.host_stats(self.target))
+
+    def toggle_trace(self):
+        if self.route.busy:
+            self.stop_trace()
+        else:
+            self.trace()
 
     def trace(self):
-        self.run("Tracing the route - Stop cancels", self.trace_route)
+        if not self.route.busy:
+            self.trace_stop.clear()
+            self.route.start("running...", self.trace_route)
 
-    def stop(self):
-        self.cancel.set()
-        if self.proc:
+    def stop_trace(self):
+        self.trace_stop.set()
+        proc = self.proc
+        if proc:
             try:
-                self.proc.kill()
+                proc.kill()
             except OSError:
                 pass
 
     def copy(self):
         self.clipboard_clear()
-        self.clipboard_append(self.text.get("1.0", "end-1c"))
-        self.status.config(text="Copied to the clipboard.")
+        self.clipboard_append("\n\n".join(c.text.get("1.0", "end-1c")
+                                          for c in (self.info, self.route)))
+        self.note.config(text="Copied to the clipboard.")
 
     def close(self):
-        self.stop()
+        self.stop_trace()
+        self.namer.shutdown(wait=False)
         self.app.info_windows.pop(self.target, None)
         self.destroy()
 
-    # ---- jobs (worker thread) --------------------------------------------
+    # ---- jobs (worker threads) -------------------------------------------
 
     def general(self, stats):
-        host, port = self.host, self.port
-        self.section(f"Host Info  {datetime.now():%Y-%m-%d %H:%M:%S}")
-        self.kv("Target", self.target + (f"  (TCP check on port {port})" if port else ""))
+        c, host, port = self.info, self.host, self.port
+        c.section(f"Target  {datetime.now():%H:%M:%S}")
+        c.kv("Target", self.target + (f"  (TCP check on port {port})" if port else ""))
         try:
             addrs = [str(ipaddress.ip_address(host))]
+            is_name = False
         except ValueError:
-            try:
-                infos = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM, 0,
-                                           socket.AI_CANONNAME)
-            except (OSError, UnicodeError) as e:
-                self.kv("Forward lookup", f"failed ({e})", "bad")
-                infos = []
-            addrs = list(dict.fromkeys(sa[0] for *_, sa in infos))
-            if addrs:
-                self.kv("Forward lookup", ", ".join(addrs))
-            canon = infos[0][3] if infos else ""
-            if canon and canon.lower() != host.lower():
-                self.kv("Canonical name", canon)
-        addrs.sort(key=lambda a: ":" in a)      # IPv4 first
-        for a in addrs[:4]:
-            self.kv("Address", f"{a}  ({describe_ip(a)})")
+            is_name = True
+            addrs = sorted(dict.fromkeys(a for _, a in core.lookup(host)), key=lambda a: ":" in a)
+            c.kv("Forward lookup", ", ".join(addrs[:4]) if addrs else "failed - name not found",
+                 "val" if addrs else "bad")
         if addrs:
-            self.lookup_back(addrs[0])
+            self.where(addrs[0])
+
+        c.section("Reply")
         ok, ms, ttl = core.echo(host)
         if ok:
-            self.kv("Echo reply", core.fmt_rtt(ms) + (f", TTL {ttl}: {ttl_guess(ttl)}" if ttl else ""))
+            c.kv("Echo reply", core.fmt_rtt(ms) + (f", TTL {ttl}: {ttl_guess(ttl)}" if ttl else ""))
         else:
-            self.kv("Echo reply", "no reply", "bad")
+            c.kv("Echo reply", "no reply", "bad")
         if port:
             ok, ms = core.tcp_ping(host, port)
-            self.kv(f"TCP port {port}", f"accepts connections ({core.fmt_rtt(ms)})" if ok
-                    else "no connection", "val" if ok else "bad")
+            c.kv(f"TCP port {port}", f"accepts connections ({core.fmt_rtt(ms)})" if ok
+                 else "no connection", "val" if ok else "bad")
 
-        self.section("Monitoring")
-        if not stats:
-            self.out("not in the target list any more", "warn")
-            return
-        since = stats["since"]
-        state = stats["status"]
-        if since:
-            state += f" since {since:%H:%M:%S} ({fmt_dur((datetime.now() - since).total_seconds())})"
-        self.kv("Status", state, {"DOWN": "bad", "LOST": "warn", "SLOW": "warn"}.get(stats["status"], "val"))
-        self.kv("Pings", f"{stats['sent']} sent, {stats['lost']} lost "
-                         f"({core.pct(stats['lost'], stats['sent'])})")
-        if stats["n"]:
-            self.kv("RTT", f"last {core.fmt_rtt(stats['last'])}, min {stats['min']:.1f}, "
-                           f"avg {stats['avg']:.1f}, max {stats['max']:.1f} ms")
-            if stats["jitter"] is not None:
-                self.kv("Jitter", f"{stats['jitter']:.1f} ms (over the last {stats['n']} replies)")
-        count, longest, total = stats["outages"]
-        self.kv("Outages", f"{count}, longest {fmt_dur(longest)}, total {fmt_dur(total)}"
-                if count else "none since PingMon started")
-
-    def lookup_back(self, addr):
-        """Reverse DNS, whether that name points back, and the local address used to get there."""
-        try:
-            name, aliases, _ = socket.gethostbyaddr(addr)
-        except (OSError, UnicodeError):
-            self.kv("Reverse DNS", "no PTR record", "warn")
+        c.section("Monitoring")
+        if stats:
+            self.monitoring(stats)
         else:
-            self.kv("Reverse DNS", name + (f"  (aliases: {', '.join(aliases)})" if aliases else ""))
-            back = {a for _, a in core.lookup(name)}
-            self.kv("Forward-confirmed", f"yes, {name} points back" if addr in back
-                    else "no, that name resolves elsewhere", "val" if addr in back else "warn")
+            c.out("not in the target list any more", "warn")
+
+        c.section("DNS")      # last: a missing PTR record can take seconds to time out
+        if is_name:
+            try:
+                canon = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM, 0,
+                                           socket.AI_CANONNAME)[0][3]
+            except (OSError, UnicodeError, IndexError):
+                canon = ""
+            if canon and canon.lower() != host.lower():
+                c.kv("Canonical name", canon)
+        if not addrs:
+            c.out("no address to look up", "warn")
+            return
+        try:
+            name, aliases, _ = socket.gethostbyaddr(addrs[0])
+        except (OSError, UnicodeError):
+            c.kv("Reverse DNS", f"no PTR record for {addrs[0]}", "warn")
+            return
+        c.kv("Reverse DNS", name + (f"  (aliases: {', '.join(aliases)})" if aliases else ""))
+        back = {a for _, a in core.lookup(name)}
+        c.kv("Forward-confirmed", f"yes, {name} points back" if addrs[0] in back
+             else "no, that name resolves elsewhere", "val" if addrs[0] in back else "warn")
+
+    def where(self, addr):
+        """Where the pings go: address, next hop, local side. Routing table only, nothing sent."""
+        c = self.info
+        c.kv("Pings go to", f"{addr}" + (f" port {self.port} (TCP)" if self.port else "")
+             + f"  ({describe_ip(addr)})")
         try:    # connecting a UDP socket sends nothing; it only asks the routing table
             with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET,
                                socket.SOCK_DGRAM) as s:
                 s.connect((addr, 9))
-                self.kv("Local address", f"{s.getsockname()[0]}  (this PC's side of the route)")
+                local = s.getsockname()[0]
         except OSError:
-            self.kv("Local address", "no route to this address", "bad")
+            c.kv("Route", "none - this PC has no route to that address", "bad")
+            return
+        if ":" not in addr:
+            try:
+                gw = next_hop(addr)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                gw = "?"
+            if gw in (None, local, addr):
+                c.kv("Next hop", "direct - same network as this PC")
+            elif gw != "?":
+                c.kv("Next hop", f"{gw}  (gateway)")
+        c.kv("Local address", f"{local}  (this PC's side)")
+
+    def monitoring(self, stats):
+        c = self.info
+        since, state = stats["since"], stats["status"]
+        if since:
+            state += f" since {since:%H:%M:%S} ({fmt_dur((datetime.now() - since).total_seconds())})"
+        c.kv("Status", state, {"DOWN": "bad", "LOST": "warn", "SLOW": "warn"}.get(stats["status"], "val"))
+        c.kv("Pings", f"{stats['sent']} sent, {stats['lost']} lost "
+                      f"({core.pct(stats['lost'], stats['sent'])})")
+        if stats["n"]:
+            c.kv("RTT", f"last {core.fmt_rtt(stats['last'])}, min {stats['min']:.1f}, "
+                        f"avg {stats['avg']:.1f}, max {stats['max']:.1f} ms")
+            if stats["jitter"] is not None:
+                c.kv("Jitter", f"{stats['jitter']:.1f} ms (over the last {stats['n']} replies)")
+        count, longest, total = stats["outages"]
+        c.kv("Outages", f"{count}, longest {fmt_dur(longest)}, total {fmt_dur(total)}"
+             if count else "none since PingMon started")
+
+    @staticmethod
+    def hop_name(c, key, addr):
+        try:
+            c.append(key, f"  {socket.gethostbyaddr(addr)[0]}")
+        except (OSError, UnicodeError):
+            pass
 
     def trace_route(self):
-        self.section(f"Trace Route  {datetime.now():%H:%M:%S}")
+        c = self.route
+        c.out(f"{datetime.now():%H:%M:%S}  route to {self.host}", "head")
         extra = {}
+        # -d / -n: hop names are looked up here in parallel, tracert would wait for each one
         if IS_WINDOWS:
-            cmd = ["tracert", "-h", "30", "-w", "1000", self.host]
+            cmd = ["tracert", "-d", "-h", "30", "-w", "1000", self.host]
             extra = {"creationflags": 0x08000000, "encoding": "oem"}
         else:
             tool = shutil.which("traceroute") or shutil.which("tracepath")
             if not tool:
-                self.out("neither traceroute nor tracepath is installed", "warn")
+                c.out("neither traceroute nor tracepath is installed", "warn")
                 return
-            cmd = [tool, self.host]
+            cmd = [tool, "-n", self.host]
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT, text=True, errors="replace",
                                          **extra)
         except OSError as e:
-            self.out(f"could not start {cmd[0]}: {e}", "bad")
+            c.out(f"could not start {cmd[0]}: {e}", "bad")
             return
-        for line in self.proc.stdout:
-            if line.strip():
-                self.out(line.rstrip())
+        dead, last = 0, None
+        for n, line in enumerate(self.proc.stdout):
+            line = line.rstrip()
+            if not line.strip():
+                continue
+            hop = re.match(r"\s*(\d+)\??:?\s", line)
+            found = HOP_ADDR.findall(line) if hop else []
+            c.out(line, key=n if found else None)
+            if not hop:
+                continue
+            c.status(f"hop {hop.group(1)}")
+            if found or re.search(r"\d\s*ms", line):   # the hop answered, if only "unreachable"
+                dead = 0
+                if found:
+                    last = (hop.group(1), found[-1])
+                    self.namer.submit(self.hop_name, c, n, found[-1])
+                continue
+            dead += 1
+            if dead >= self.DEAD_HOPS:      # an offline host would leave 30 hops of timeouts
+                self.proc.kill()
+                c.out(f"{dead} hops in a row without any reply - stopped.", "warn")
+                c.out(f"The route ends after hop {last[0]} ({last[1]})." if last
+                      else "Not even the first hop answered.", "warn")
+                break
         self.proc.wait()
         self.proc = None
-        if self.cancel.is_set():
-            self.out("stopped", "warn")
+        if self.trace_stop.is_set():
+            c.out("stopped", "warn")
 
 
 class App:

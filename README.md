@@ -48,8 +48,10 @@ One lost ping shows as orange **LOST** (and in the event log); two in a row make
 the host **DOWN**: red, beep, tray notification, red tray icon. Yellow **SLOW**
 marks replies above *View → Slow Threshold*. The DNS column fills itself in
 (reverse name of an IP, address of a hostname). Double-click a host, or
-right-click → *Host Info* (Alt+Enter), for DNS in both directions, TTL with an
-OS guess, RTT/jitter/outage statistics and a trace route.
+right-click → *Host Info* (Alt+Enter), for where the pings go (address, next hop,
+local address; works for offline hosts too), TTL with an OS guess, RTT/jitter/outage
+statistics, DNS in both directions, and a trace route that runs alongside and gives
+up after 3 silent hops.
 
 **Settings** menu (GUI only): *Start with Windows* (per-user `HKCU\...\Run` entry,
 no admin), *Start Minimized to Tray*, *Close to Tray* (keeps monitoring in the

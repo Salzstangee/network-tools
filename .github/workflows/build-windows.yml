@@ -44,6 +44,9 @@ jobs:
           loader.exec_module(gui)
           assert gui.version_tuple("v1.10") > gui.version_tuple("1.9")
           assert gui.dns_name("127.0.0.1"), "reverse lookup of loopback"
+          gw, lo = gui.next_hop("8.8.8.8"), gui.next_hop("127.0.0.1")
+          print(f"::notice::next hop to 8.8.8.8: {gw}, to 127.0.0.1: {lo}")
+          assert gw and gw != "8.8.8.8" and lo is None, (gw, lo)
           print("gui ok", gui.VERSION, gui.dns_name("127.0.0.1"))
       - run: pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico --hidden-import pystray._win32 pingmon_gui.pyw
       - name: Smoke test the exe, also as restarted by an update
