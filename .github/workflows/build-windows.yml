@@ -50,13 +50,12 @@ jobs:
         shell: python
         run: |
           import importlib.machinery, importlib.util, json, os, socket, subprocess, sys, time, traceback
-          loader = importlib.machinery.SourceFileLoader("gui", "pingmon_gui.pyw")
-          gui = importlib.util.module_from_spec(importlib.util.spec_from_loader("gui", loader))
-          loader.exec_module(gui)
+          sys.path.insert(0, ".")
           exe = os.path.abspath(r"dist\PingMon.exe")
 
           def annotate(level, msg):     # annotations are readable through the API, logs are not
-              print(f"::{level}::" + str(msg).replace("%", "%25").replace("\n", "%0A"), flush=True)
+              msg = str(msg).encode("ascii", "replace").decode()
+              print(f"::{level}::" + msg.replace("%", "%25").replace("\n", "%0A"), flush=True)
 
           def launch(cmd, env, wait=45):
               """Start PingMon; (answers on its single-instance port, still running, stderr)."""
@@ -76,6 +75,9 @@ jobs:
               return ok, alive, err
 
           try:
+              loader = importlib.machinery.SourceFileLoader("gui", "pingmon_gui.pyw")
+              gui = importlib.util.module_from_spec(importlib.util.spec_from_loader("gui", loader))
+              loader.exec_module(gui)
               ok, alive, err = launch([exe], dict(os.environ))
               if not ok:
                   _, _, src_err = launch([sys.executable, "pingmon_gui.pyw"], dict(os.environ), 30)
