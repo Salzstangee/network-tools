@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -34,7 +35,7 @@ except Exception:       # not installed, or no usable tray backend (pystray rais
     pystray = None
 
 APP = "PingMon"
-VERSION = "1.2"
+VERSION = "1.3"
 IS_WINDOWS = sys.platform == "win32"
 REPO = "https://github.com/Salzstangee/network-tools"
 SELF_UPDATE = IS_WINDOWS and getattr(sys, "frozen", False)    # only the exe can swap itself
@@ -43,11 +44,12 @@ INSTANCE_PORT = 47231   # loopback port that keeps PingMon single-instance
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 DEFAULTS = {"autostart": False, "start_minimized": True, "close_to_tray": False,
             "notify": True, "interval": 1.0, "beep": False, "on_top": False,
-            "check_updates": True}
+            "check_updates": True, "slow_ms": 100}
 REFRESH_MS = 250        # UI poll rate
 GRAPH_POINTS = 600      # samples kept per host (feeds the graph and the wide loss strip)
 GRAPH_WINDOW = 300      # samples the RTT graph spreads across its full width
 LOG_LINES = 500         # event log length
+DOWN_AFTER = 2          # lost pings in a row before a host is DOWN (beep, toast, red tray icon)
 
 # Win9x system palette
 FACE = "#c0c0c0"
@@ -63,6 +65,8 @@ GRID = "#004000"
 RED = "#ff2020"
 DIMRED = "#800000"
 AMBER = "#ffb000"
+YELLOW = "#ffff00"
+DIMYELLOW = "#808000"
 GREY = "#808080"
 
 # 16x16 pixel art, one char per pixel: . = transparent
@@ -172,6 +176,23 @@ ICONS = {
         "..kkkkkkkkkkkk..",
         "................",
         "................"],
+    "lookup": [
+        "................",
+        "...kkkkk........",
+        "..kwwwwwk.......",
+        ".kwwbbwwwk......",
+        ".kwbwwwwwk......",
+        ".kwbwwwwwk......",
+        ".kwwwwwwwk......",
+        ".kwwwwwwwk......",
+        "..kwwwwwk.......",
+        "...kkkkkk.......",
+        "........kkk.....",
+        ".........kkk....",
+        "..........kkk...",
+        "...........kkk..",
+        "............kk..",
+        "................"],
     "info": [
         "................",
         ".....kkkkkk.....",
@@ -210,11 +231,27 @@ def pick_font(root, candidates, size, weight="normal"):
     return tkfont.Font(root=root, family=candidates[-1], size=size, weight=weight)
 
 
-def rtt_ms(rtt):
+def fmt_dur(secs):
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{secs % 3600 // 60:02d}m"
+
+
+def dns_name(target):
+    """What the DNS column shows: the reverse name of an IP, or the address a hostname has."""
+    host, _ = core.split_port(target)
     try:
-        return float(rtt.rstrip("ms"))
-    except (AttributeError, ValueError):
-        return 0.0
+        ipaddress.ip_address(host)
+    except ValueError:
+        addrs = sorted(core.lookup(host), key=lambda a: a[0] != socket.AF_INET)
+        return addrs[0][1] if addrs else "(no DNS)"
+    try:
+        return socket.gethostbyaddr(host)[0]
+    except (OSError, UnicodeError):
+        return ""
 
 
 def bevel(canvas, x0, y0, x1, y1, sunken=False):
@@ -678,6 +715,262 @@ class UpdateDialog(Dialog):
         super().close()
 
 
+def describe_ip(addr):
+    ip = ipaddress.ip_address(addr)
+    for test, what in ((ip.is_loopback, "loopback"), (ip.is_link_local, "link-local"),
+                       (ip.is_multicast, "multicast"), (ip.is_private, "private"),
+                       (ip.is_global, "public")):
+        if test:
+            return f"IPv{ip.version}, {what}"
+    return f"IPv{ip.version}"
+
+
+def ttl_guess(ttl):
+    """Replies start at TTL 64 (Linux, macOS, most embedded), 128 (Windows) or 255 (routers)."""
+    for start, what in ((64, "Linux/Unix/macOS or embedded"), (128, "Windows"),
+                        (255, "router or switch")):
+        if ttl <= start:
+            hops = start - ttl
+            return f"probably {what}, {hops} hop{'' if hops == 1 else 's'} away"
+    return ""
+
+
+class HostInfo(tk.Toplevel):
+    """Host Info window: DNS both ways, echo reply, what the monitor saw, trace route."""
+
+    def __init__(self, app, target):
+        super().__init__(app.root, bg=FACE)
+        self.app, self.target = app, target
+        self.host, self.port = core.split_port(target)
+        self.lines = queue.Queue()      # (segments) from the worker, None when a job is done
+        self.cancel = threading.Event()
+        self.proc = None
+        self.busy = False
+        self.sections = 0
+        self.title(f"Host Info - {target}")
+        self.transient(app.root)    # stays above an always-on-top PingMon, hides with it
+        self.geometry("760x500")
+        self.minsize(480, 300)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+
+        head = tk.Frame(self, bg=FACE, padx=10, pady=8)
+        head.pack(fill="x")
+        tk.Label(head, image=app.icons["lookup"], bg=FACE).pack(side="left", padx=(0, 8))
+        tk.Label(head, text=target, bg=FACE, font=app.ui_bold).pack(side="left")
+
+        btns = tk.Frame(self, bg=FACE, padx=10)
+        self.status = tk.Label(self, text="", bg=FACE, bd=1, relief="sunken", anchor="w", padx=3)
+        self.status.pack(side="bottom", fill="x", padx=2, pady=(0, 2))
+        btns.pack(side="bottom", fill="x", pady=8)
+        wrap = tk.Frame(self, bd=2, relief="sunken")
+        wrap.pack(fill="both", expand=True, padx=10)
+        self.text = tk.Text(wrap, bg=SCREEN, fg=GREEN, font=app.mono, bd=0, padx=6, pady=4,
+                            highlightthickness=0, wrap="none", cursor="arrow")
+        sb = tk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        for tag, colour in (("head", AMBER), ("key", DIMGREEN), ("val", GREEN),
+                            ("warn", AMBER), ("bad", RED)):
+            self.text.tag_configure(tag, foreground=colour)
+        self.text.configure(state="disabled")
+
+        def button(text, cmd, side="left"):
+            b = tk.Button(btns, text=text, width=12, bg=FACE, activebackground=FACE, command=cmd)
+            b.pack(side=side, padx=(0, 6) if side == "left" else (6, 0))
+            return b
+        self.b_refresh = button("Refresh", self.refresh)
+        self.b_trace = button("Trace Route", self.trace)
+        self.b_stop = button("Stop", self.stop)
+        button("Close", self.close, "right")
+        button("Copy All", self.copy, "right")
+        self.refresh()
+        self.poll()
+
+    # ---- job plumbing ----------------------------------------------------
+
+    def run(self, status, job, *args):
+        if self.busy:
+            return
+        self.busy = True
+        self.cancel.clear()
+        self.status.config(text=status)
+        for b, on in ((self.b_refresh, False), (self.b_trace, False), (self.b_stop, True)):
+            b.config(state="normal" if on else "disabled")
+        threading.Thread(target=self.work, args=(job, args), daemon=True).start()
+
+    def work(self, job, args):
+        try:
+            job(*args)
+        except Exception as e:      # a lookup gone wrong must not leave the window stuck
+            self.out(f"error: {e}", "bad")
+        self.lines.put(None)
+
+    def poll(self):
+        if not self.winfo_exists():
+            return
+        changed = False
+        while not self.lines.empty():
+            segs = self.lines.get_nowait()
+            if segs is None:
+                self.busy = False
+                self.status.config(text="Ready")
+                for b, on in ((self.b_refresh, True), (self.b_trace, True), (self.b_stop, False)):
+                    b.config(state="normal" if on else "disabled")
+                continue
+            if not changed:
+                self.text.configure(state="normal")
+                changed = True
+            for text, tag in segs:
+                self.text.insert("end", text, tag)
+            self.text.insert("end", "\n")
+        if changed:
+            self.text.see("end")
+            self.text.configure(state="disabled")
+        self.after(80, self.poll)
+
+    def out(self, text, tag="val"):
+        self.lines.put([(text, tag)])
+
+    def kv(self, key, value, tag="val"):
+        self.lines.put([(f"{key} ".ljust(19, "."), "key"), (f" {value}", tag)])
+
+    def section(self, title):
+        if self.sections:
+            self.lines.put([])      # blank line between sections, not above the first
+        self.sections += 1
+        self.lines.put([(f"== {title} ".ljust(64, "="), "head")])
+
+    # ---- buttons ---------------------------------------------------------
+
+    def refresh(self):
+        self.run("Looking up...", self.general, self.app.host_stats(self.target))
+
+    def trace(self):
+        self.run("Tracing the route - Stop cancels", self.trace_route)
+
+    def stop(self):
+        self.cancel.set()
+        if self.proc:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+    def copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.text.get("1.0", "end-1c"))
+        self.status.config(text="Copied to the clipboard.")
+
+    def close(self):
+        self.stop()
+        self.app.info_windows.pop(self.target, None)
+        self.destroy()
+
+    # ---- jobs (worker thread) --------------------------------------------
+
+    def general(self, stats):
+        host, port = self.host, self.port
+        self.section(f"Host Info  {datetime.now():%Y-%m-%d %H:%M:%S}")
+        self.kv("Target", self.target + (f"  (TCP check on port {port})" if port else ""))
+        try:
+            addrs = [str(ipaddress.ip_address(host))]
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM, 0,
+                                           socket.AI_CANONNAME)
+            except (OSError, UnicodeError) as e:
+                self.kv("Forward lookup", f"failed ({e})", "bad")
+                infos = []
+            addrs = list(dict.fromkeys(sa[0] for *_, sa in infos))
+            if addrs:
+                self.kv("Forward lookup", ", ".join(addrs))
+            canon = infos[0][3] if infos else ""
+            if canon and canon.lower() != host.lower():
+                self.kv("Canonical name", canon)
+        addrs.sort(key=lambda a: ":" in a)      # IPv4 first
+        for a in addrs[:4]:
+            self.kv("Address", f"{a}  ({describe_ip(a)})")
+        if addrs:
+            self.lookup_back(addrs[0])
+        ok, ms, ttl = core.echo(host)
+        if ok:
+            self.kv("Echo reply", core.fmt_rtt(ms) + (f", TTL {ttl}: {ttl_guess(ttl)}" if ttl else ""))
+        else:
+            self.kv("Echo reply", "no reply", "bad")
+        if port:
+            ok, ms = core.tcp_ping(host, port)
+            self.kv(f"TCP port {port}", f"accepts connections ({core.fmt_rtt(ms)})" if ok
+                    else "no connection", "val" if ok else "bad")
+
+        self.section("Monitoring")
+        if not stats:
+            self.out("not in the target list any more", "warn")
+            return
+        since = stats["since"]
+        state = stats["status"]
+        if since:
+            state += f" since {since:%H:%M:%S} ({fmt_dur((datetime.now() - since).total_seconds())})"
+        self.kv("Status", state, {"DOWN": "bad", "LOST": "warn", "SLOW": "warn"}.get(stats["status"], "val"))
+        self.kv("Pings", f"{stats['sent']} sent, {stats['lost']} lost "
+                         f"({core.pct(stats['lost'], stats['sent'])})")
+        if stats["n"]:
+            self.kv("RTT", f"last {core.fmt_rtt(stats['last'])}, min {stats['min']:.1f}, "
+                           f"avg {stats['avg']:.1f}, max {stats['max']:.1f} ms")
+            if stats["jitter"] is not None:
+                self.kv("Jitter", f"{stats['jitter']:.1f} ms (over the last {stats['n']} replies)")
+        count, longest, total = stats["outages"]
+        self.kv("Outages", f"{count}, longest {fmt_dur(longest)}, total {fmt_dur(total)}"
+                if count else "none since PingMon started")
+
+    def lookup_back(self, addr):
+        """Reverse DNS, whether that name points back, and the local address used to get there."""
+        try:
+            name, aliases, _ = socket.gethostbyaddr(addr)
+        except (OSError, UnicodeError):
+            self.kv("Reverse DNS", "no PTR record", "warn")
+        else:
+            self.kv("Reverse DNS", name + (f"  (aliases: {', '.join(aliases)})" if aliases else ""))
+            back = {a for _, a in core.lookup(name)}
+            self.kv("Forward-confirmed", f"yes, {name} points back" if addr in back
+                    else "no, that name resolves elsewhere", "val" if addr in back else "warn")
+        try:    # connecting a UDP socket sends nothing; it only asks the routing table
+            with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET,
+                               socket.SOCK_DGRAM) as s:
+                s.connect((addr, 9))
+                self.kv("Local address", f"{s.getsockname()[0]}  (this PC's side of the route)")
+        except OSError:
+            self.kv("Local address", "no route to this address", "bad")
+
+    def trace_route(self):
+        self.section(f"Trace Route  {datetime.now():%H:%M:%S}")
+        extra = {}
+        if IS_WINDOWS:
+            cmd = ["tracert", "-h", "30", "-w", "1000", self.host]
+            extra = {"creationflags": 0x08000000, "encoding": "oem"}
+        else:
+            tool = shutil.which("traceroute") or shutil.which("tracepath")
+            if not tool:
+                self.out("neither traceroute nor tracepath is installed", "warn")
+                return
+            cmd = [tool, self.host]
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, errors="replace",
+                                         **extra)
+        except OSError as e:
+            self.out(f"could not start {cmd[0]}: {e}", "bad")
+            return
+        for line in self.proc.stdout:
+            if line.strip():
+                self.out(line.rstrip())
+        self.proc.wait()
+        self.proc = None
+        if self.cancel.is_set():
+            self.out("stopped", "warn")
+
+
 class App:
     def __init__(self, root, server=None):
         self.root = root
@@ -689,8 +982,14 @@ class App:
         self.selected = None
         self.samples = {}           # host -> deque of (up, rtt_ms)
         self.last_checked = {}      # host -> datetime of the last sample taken
-        self.last_state = {}        # host -> last up/down seen, for the event log
+        self.alarm = {}             # host -> True while DOWN, False once seen up
+        self.since = {}             # host -> start of the current UP/DOWN period
+        self.outages = {}           # host -> [count, longest_s, total_s]
         self.counts = {}            # host -> samples taken in total, scrolls the graph grid
+        self.names = {}             # host -> DNS column text
+        self.resolving = set()
+        self.resolver = ThreadPoolExecutor(max_workers=8)
+        self.info_windows = {}      # host -> open HostInfo window
         self.rows = []              # host order as drawn
 
         root.title(f"{APP} - Network Monitor")
@@ -725,6 +1024,7 @@ class App:
         self.v_close_tray = tk.BooleanVar(value=st["close_to_tray"])
         self.v_notify = tk.BooleanVar(value=st["notify"])
         self.v_updates = tk.BooleanVar(value=st["check_updates"])
+        self.slow_ms = tk.IntVar(value=st["slow_ms"])
         root.attributes("-topmost", self.on_top.get())
 
         self.build_menu()
@@ -769,6 +1069,8 @@ class App:
         t.add_command(label="Sweep Network...", underline=0, accelerator="Ctrl+S",
                       command=self.ask_sweep)
         t.add_separator()
+        t.add_command(label="Host Info...", underline=0, accelerator="Alt+Enter",
+                      command=self.host_info)
         t.add_command(label="Remove Selected", underline=0, accelerator="Del",
                       command=self.remove_selected)
         t.add_command(label="Copy Address", underline=0, accelerator="Ctrl+C",
@@ -785,6 +1087,11 @@ class App:
                                variable=self.interval, value=float(sec),
                                command=self.set_interval)
         v.add_cascade(label="Ping Interval", underline=0, menu=iv)
+        sl = tk.Menu(v)
+        for ms in (0, 20, 50, 100, 200, 500):
+            sl.add_radiobutton(label=f"{ms} ms" if ms else "Off", variable=self.slow_ms,
+                               value=ms, command=self.set_slow)
+        v.add_cascade(label="Slow Threshold (yellow)", underline=0, menu=sl)
         v.add_separator()
         v.add_checkbutton(label="Always on Top", underline=0, variable=self.on_top,
                           command=self.apply_top)
@@ -822,6 +1129,8 @@ class App:
         self.root.config(menu=m)
 
         self.ctx = tk.Menu(self.root)
+        self.ctx.add_command(label="Host Info...", command=self.host_info)
+        self.ctx.add_separator()
         self.ctx.add_command(label="Copy Address", command=self.copy_selected)
         self.ctx.add_command(label="Remove", command=self.remove_selected)
 
@@ -839,6 +1148,7 @@ class App:
                                 ("clear", "Clear", lambda: self.clear(True))):
             ToolButton(inner, self.icons[icon], text, cmd).pack(side="left")
         tk.Frame(inner, width=2, bd=1, relief="sunken").pack(side="left", fill="y", padx=6)
+        ToolButton(inner, self.icons["lookup"], "Info", self.host_info).pack(side="left")
         ToolButton(inner, self.icons["top"], "On Top", self.toggle_top).pack(side="left")
         ToolButton(inner, self.icons["info"], "About",
                    lambda: AboutDialog(self)).pack(side="left")
@@ -866,6 +1176,7 @@ class App:
         self.list.pack(side="left", fill="both", expand=True)
         self.list.bind("<Button-1>", self.on_click)
         self.list.bind("<Button-3>", self.on_context)
+        self.list.bind("<Double-Button-1>", lambda e: self.row_at(e.y) and self.host_info())
         self.list.bind("<MouseWheel>",
                        lambda e: self.list.yview_scroll(-e.delta // 120, "units"))
         self.list.bind("<Button-4>", lambda e: self.list.yview_scroll(-1, "units"))
@@ -918,6 +1229,7 @@ class App:
         r.bind("<Control-c>", lambda e: None if e.widget is self.entry else self.copy_selected())
         r.bind("<Up>", lambda e: self.move_sel(-1))
         r.bind("<Down>", lambda e: self.move_sel(1))
+        r.bind("<Alt-Return>", lambda e: self.host_info())
 
     # ---- actions --------------------------------------------------------
 
@@ -1021,6 +1333,39 @@ class App:
         self.log(f"ping interval set to {core.INTERVAL:g}s", AMBER)
         self.persist()
 
+    def set_slow(self):
+        ms = self.slow_ms.get()
+        self.log(f"slow threshold {'set to %d ms' % ms if ms else 'off'}", AMBER)
+        self.persist()
+
+    def host_info(self):
+        host = self.selected
+        if not host:
+            self.flash("Select a target first.")
+            return
+        win = self.info_windows.get(host)
+        if win and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        self.info_windows[host] = HostInfo(self, host)
+
+    def host_stats(self, host):
+        """Snapshot of what the monitor knows about a host, for the Host Info window."""
+        with core.lock:
+            t = core.targets.get(host)
+            t = dict(t) if t else None
+        if not t:
+            return None
+        vals = [v for up, v in self.samples.get(host, ()) if up and v is not None]
+        steps = [abs(b - a) for a, b in zip(vals, vals[1:])]
+        return {"status": self.status_of(host, t)[0], "since": self.since.get(host),
+                "sent": t["sent"], "lost": t["lost"], "last": t["ms"], "n": len(vals),
+                "min": min(vals) if vals else None, "max": max(vals) if vals else None,
+                "avg": sum(vals) / len(vals) if vals else None,
+                "jitter": sum(steps) / len(steps) if steps else None,
+                "outages": list(self.outages.get(host, [0, 0, 0]))}
+
     def apply_top(self):
         self.root.attributes("-topmost", self.on_top.get())
         self.persist()
@@ -1035,7 +1380,7 @@ class App:
                              beep=self.beep.get(), autostart=self.v_autostart.get(),
                              start_minimized=self.v_minimized.get(),
                              close_to_tray=self.v_close_tray.get(), notify=self.v_notify.get(),
-                             check_updates=self.v_updates.get())
+                             check_updates=self.v_updates.get(), slow_ms=self.slow_ms.get())
         save_settings(self.settings)
 
     def toggle_autostart(self):
@@ -1132,12 +1477,13 @@ class App:
                                           filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not path:
             return
-        n = 0
-        with open(path) as fh:
-            for line in fh:
-                host = line.strip()
-                if host and not host.startswith("#") and core.add(host):
-                    n += 1
+        try:    # utf-8-sig: Notepad likes to start files with a BOM
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                hosts = [tok for line in fh for tok in line.split("#", 1)[0].split()]
+        except OSError as e:
+            messagebox.showerror(APP, f"Could not read the file:\n{e}", parent=self.root)
+            return
+        n = sum(1 for h in hosts if core.add(h))
         core.save()
         self.log(f"imported {n} target(s) from {os.path.basename(path)}", AMBER)
 
@@ -1149,8 +1495,12 @@ class App:
             return
         with core.lock:
             hosts = list(core.targets)
-        with open(path, "w") as fh:
-            fh.write("\n".join(hosts) + "\n")
+        try:
+            with open(path, "w") as fh:
+                fh.write("\n".join(hosts) + "\n")
+        except OSError as e:
+            messagebox.showerror(APP, f"Could not write the file:\n{e}", parent=self.root)
+            return
         self.flash(f"Exported {len(hosts)} target(s).")
 
     def quit(self):
@@ -1232,30 +1582,21 @@ class App:
         with core.lock:
             items = [(h, dict(t, hist=list(t["hist"]))) for h, t in core.targets.items()]
         live = {h for h, _ in items}
-        for d in (self.samples, self.last_checked, self.last_state, self.counts):
+        for d in (self.samples, self.last_checked, self.alarm, self.since, self.outages,
+                  self.counts, self.names):
             for gone in set(d) - live:
                 del d[gone]
 
         for host, t in items:
+            if host not in self.names and host not in self.resolving:
+                self.resolving.add(host)
+                self.resolver.submit(self.resolve, host)
             if t["checked"] and t["checked"] != self.last_checked.get(host):
                 self.last_checked[host] = t["checked"]
                 self.counts[host] = self.counts.get(host, 0) + 1
                 self.samples.setdefault(host, deque(maxlen=GRAPH_POINTS)).append(
-                    (t["up"], rtt_ms(t["rtt"]) if t["up"] else None))
-            prev = self.last_state.get(host)
-            if t["up"] is not None and t["up"] is not prev:
-                if prev is not None:
-                    if t["up"]:
-                        self.log(f"{host:<16} UP    (rtt {t['rtt']})", GREEN)
-                        self.notify(f"{host} is back UP ({t['rtt']})")
-                    else:
-                        self.log(f"{host:<16} DOWN  ** no reply **", RED)
-                        self.notify(f"{host} is DOWN - no reply")
-                        if self.beep.get():
-                            self.root.bell()
-                elif not t["up"]:
-                    self.log(f"{host:<16} DOWN  at first check", RED)
-                self.last_state[host] = t["up"]
+                    (t["up"], t["ms"] if t["up"] else None))
+                self.transition(host, t)
 
         if self.selected not in live:
             self.selected = items[0][0] if items else None
@@ -1266,15 +1607,67 @@ class App:
         self.update_status()
         self.root.after(REFRESH_MS, self.tick)
 
+    def resolve(self, host):
+        self.names[host] = dns_name(host)
+        self.resolving.discard(host)
+
+    def transition(self, host, t):
+        """Event log, toast and beep for a fresh sample. One lost ping is only noted;
+        DOWN_AFTER in a row make the host DOWN."""
+        streak = 0
+        for ok in reversed(t["hist"]):
+            if ok:
+                break
+            streak += 1
+        prev = self.alarm.get(host)     # None = not judged yet, True = DOWN, False = up
+        if t["up"]:
+            if prev:
+                secs = (t["since"] - self.since[host]).total_seconds()
+                o = self.outages.setdefault(host, [0, 0.0, 0.0])
+                o[0] += 1
+                o[1] = max(o[1], secs)
+                o[2] += secs
+                self.log(f"{host:<16} UP    after {fmt_dur(secs)} down (rtt {t['rtt']})", GREEN)
+                self.notify(f"{host} is back UP after {fmt_dur(secs)} ({t['rtt']})")
+            if prev is not False:
+                self.since[host] = t["since"]
+            self.alarm[host] = False
+        elif streak >= DOWN_AFTER:
+            if not prev:
+                self.since[host] = t["since"]       # the first ping of this run that got lost
+                self.alarm[host] = True
+                if prev is None:
+                    self.log(f"{host:<16} DOWN  no reply since start", RED)
+                else:
+                    self.log(f"{host:<16} DOWN  ** {streak} pings lost **", RED)
+                    self.notify(f"{host} is DOWN - no reply")
+                    if self.beep.get():
+                        self.root.bell()
+        elif prev is False:
+            self.log(f"{host:<16} LOST  {streak} ping{'s' if streak > 1 else ''}, no reply", AMBER)
+
+    def status_of(self, host, t):
+        """(label, colour) of a target as the list shows it."""
+        if t["up"] is None:
+            return "...", GREY
+        if self.alarm.get(host):
+            return "DOWN", RED
+        if not t["up"]:
+            return "LOST", AMBER
+        slow = self.slow_ms.get()
+        if slow and t["ms"] is not None and t["ms"] > slow:
+            return "SLOW", YELLOW
+        return "UP", GREEN
+
     def update_status(self):
         items = self.items
-        up = sum(1 for _, t in items if t["up"] is True)
-        down = sum(1 for _, t in items if t["up"] is False)
+        down = sum(1 for h, _ in items if self.alarm.get(h))
+        up = sum(1 for h, t in items if t["up"] is not None and not self.alarm.get(h))
         sent = sum(t["sent"] for _, t in items)
         lost = sum(t["lost"] for _, t in items)
         s = self.status
         if not s["msg"].cget("text"):
-            s["msg"].config(text="Ready - Target box takes IPs, hostnames or CIDRs")
+            s["msg"].config(text="Ready - Target box takes IPs, hostnames, host:port or CIDRs")
         s["targets"].config(text=f"{len(items)} targets")
         s["up"].config(text=f"{up} up")
         s["down"].config(text=f"{down} down", fg="#a00000" if down else "black")
@@ -1300,43 +1693,52 @@ class App:
         self.header_h = self.ui_font.metrics("linespace") + 6
         items = getattr(self, "items", [])
         self.rows = [h for h, _ in items]
+        cell = cw - 1
+        avail = c.winfo_width()
 
         hostw = max([len(h) for h in self.rows] + [16])
-        cols = [("#", 4 * cw, "e"), ("Host", (hostw + 2) * cw, "w"),
+        cols = [("#", 4 * cw, "e"), ("Host", (hostw + 2) * cw, "w"), ("DNS", 0, "w"),
                 ("Status", 9 * cw, "w"), ("RTT", 9 * cw, "e"), ("Loss", 7 * cw, "e"),
                 ("Since", 11 * cw, "w")]
+        # DNS column: as wide as the longest name, but never squeezing the loss strip below 20
+        others = sum(w for _, w, _ in cols) + 4 + 20 * cell + 2 * cw
+        names = [self.names.get(h, "") for h in self.rows]
+        dnsw = max(8, min(max([len(n) for n in names] + [8]), (avail - others) // cw - 2, 40))
+        cols[2] = ("DNS", (dnsw + 2) * cw, "w")
         # the loss strip takes whatever width is left, so a bigger window shows more pings
-        cell = cw - 1
         fixed = sum(w for _, w, _ in cols) + 4
-        slots = max(core.HISTORY, min(GRAPH_POINTS, (c.winfo_width() - fixed - 2 * cw) // cell))
+        slots = max(20, min(GRAPH_POINTS, (avail - fixed - 2 * cw) // cell))
         cols.append((f"Last {slots} pings", slots * cell + 2 * cw, "w"))
-        width = max(c.winfo_width(), sum(w for _, w, _ in cols) + 8)
+        width = max(avail, sum(w for _, w, _ in cols) + 8)
 
         y = self.header_h
+        view_top = c.canvasy(0)
+        view_bot = view_top + c.winfo_height()
         for i, (host, t) in enumerate(items):
             top, bot = y + i * self.row_h, y + (i + 1) * self.row_h
+            if bot < view_top or top > view_bot:    # only draw what is on screen
+                continue
             mid = (top + bot) // 2
-            sel = host == self.selected
-            if t["up"] is True:
-                fg, dot, status = GREEN, GREEN, "UP"
-            elif t["up"] is False:
-                fg, dot, status = RED, RED, "DOWN"
-            else:
-                fg, dot, status = GREY, GREY, "..."
-            if sel:
+            status, fg = self.status_of(host, t)
+            if host == self.selected:
                 c.create_rectangle(0, top, width, bot - 1, fill=NAVY, outline="")
                 c.create_rectangle(1, top, width - 1, bot - 2, outline=AMBER, dash=(1, 1))
-            since = t["since"].strftime("%H:%M:%S") if t["since"] else "-"
-            values = [str(i + 1), host, status, t["rtt"], core.pct(t["lost"], t["sent"]), since]
+            since = self.since.get(host) or t["since"]
+            name = names[i] if len(names[i]) <= dnsw else names[i][:dnsw - 2] + ".."
+            values = [str(i + 1), host, name, status, t["rtt"], core.pct(t["lost"], t["sent"]),
+                      since.strftime("%H:%M:%S") if since else "-"]
             x = 4
-            for (name, w, anchor), val in zip(cols, values):
+            for (col, w, anchor), val in zip(cols, values):
                 tx = x + w - cw if anchor == "e" else x
-                if name == "Status":
-                    c.create_oval(tx, mid - 4, tx + 8, mid + 4, fill=dot, outline=DARK)
-                    if t["up"] is True:
-                        c.create_oval(tx + 2, mid - 2, tx + 4, mid, fill="#c0ffc0", outline="")
+                colour = fg
+                if col == "Status":
+                    c.create_oval(tx, mid - 4, tx + 8, mid + 4, fill=fg, outline=DARK)
+                    if status in ("UP", "SLOW"):
+                        c.create_oval(tx + 2, mid - 2, tx + 4, mid, fill="#ffffff", outline="")
                     tx += 12
-                c.create_text(tx, mid, text=val, anchor=anchor, font=f, fill=fg)
+                elif col == "DNS" and host != self.selected:
+                    colour = DIMGREEN if fg == GREEN else fg
+                c.create_text(tx, mid, text=val, anchor=anchor, font=f, fill=colour)
                 x += w
             # loss strip: one cell per ping, newest on the right
             seen = self.samples.get(host)
@@ -1405,6 +1807,12 @@ class App:
         elif poly:
             g.create_rectangle(poly[0][0] - 1, poly[0][1] - 1, poly[0][0] + 1,
                                poly[0][1] + 1, fill=GREEN, outline="")
+        slow = self.slow_ms.get()
+        if slow and slow < top:
+            sy = h - 2 - (slow / top) * (h - 14)
+            g.create_line(0, sy, w, sy, fill=DIMYELLOW, dash=(4, 3))
+            g.create_text(w - 4, sy - 2, anchor="se", fill=DIMYELLOW, font=self.small_mono,
+                          text=f"slow {slow} ms")
         g.create_text(4, 3, anchor="nw", fill=GREEN, font=self.small_mono,
                       text=f"{top:.0f} ms")
         g.create_text(4, h - 3, anchor="sw", fill=GREEN, font=self.small_mono, text="0")
