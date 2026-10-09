@@ -49,42 +49,58 @@ jobs:
       - name: Smoke test the exe, also as restarted by an update
         shell: python
         run: |
-          import importlib.machinery, importlib.util, json, os, socket, subprocess, time
+          import importlib.machinery, importlib.util, json, os, socket, subprocess, sys, time, traceback
           loader = importlib.machinery.SourceFileLoader("gui", "pingmon_gui.pyw")
           gui = importlib.util.module_from_spec(importlib.util.spec_from_loader("gui", loader))
           loader.exec_module(gui)
           exe = os.path.abspath(r"dist\PingMon.exe")
 
-          def launch(env):
-              """Start the exe; True once it answers on its single-instance port."""
-              p = subprocess.Popen([exe], env=env)
-              ok, end = False, time.time() + 45
-              while not ok and time.time() < end:
+          def annotate(level, msg):     # annotations are readable through the API, logs are not
+              print(f"::{level}::" + str(msg).replace("%", "%25").replace("\n", "%0A"), flush=True)
+
+          def launch(cmd, env, wait=45):
+              """Start PingMon; (answers on its single-instance port, still running, stderr)."""
+              p = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, text=True, errors="replace")
+              ok, end = False, time.time() + wait
+              while not ok and time.time() < end and p.poll() is None:
                   try:
                       with socket.create_connection(("127.0.0.1", gui.INSTANCE_PORT), timeout=2) as c:
                           c.sendall(b"pingmon-show\n")
                           ok = c.recv(16).startswith(b"ok")
                   except OSError:
                       time.sleep(1)
+              alive = p.poll() is None
               subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+              err = p.communicate()[1][-1500:]
               time.sleep(3)
-              return ok
+              return ok, alive, err
 
-          # what a running onefile exe hands to everything it starts, dumped by a probe exe
-          with open("probe.py", "w") as fh:
-              fh.write("import json, os\nprint(json.dumps({k: v for k, v in os.environ.items() if k.startswith('_PYI')}))\n")
-          subprocess.run(["pyinstaller", "--onefile", "--distpath", "probe", "--workpath", "probe/build",
-                          "--specpath", "probe", "probe.py"], check=True, capture_output=True)
-          inherited = json.loads(subprocess.run([r"probe\probe.exe"], capture_output=True, text=True,
-                                                check=True).stdout)
-          inherited["_PYI_ARCHIVE_FILE"] = exe      # after an update the new exe has the old one's path
-          print("inherited:", inherited)
-          assert launch(dict(os.environ)), "PingMon.exe does not start"
-          print(f"::notice::restart with inherited {sorted(inherited)}: "
-                f"{'starts' if launch(dict(os.environ, **inherited)) else 'fails (the v1.2/v1.3 bug)'}")
-          os.environ.update(inherited)
-          assert launch(gui.clean_env()), "restart with clean_env() does not start"
-          print("::notice::restart with clean_env(): starts")
+          try:
+              ok, alive, err = launch([exe], dict(os.environ))
+              if not ok:
+                  _, _, src_err = launch([sys.executable, "pingmon_gui.pyw"], dict(os.environ), 30)
+                  annotate("error", f"PingMon.exe did not answer (alive={alive}).\n"
+                                    f"From source: {src_err or 'no output'}")
+                  sys.exit(1)
+              # what a running onefile exe hands to everything it starts, dumped by a probe exe
+              with open("probe.py", "w") as fh:
+                  fh.write("import json, os\n"
+                           "print(json.dumps({k: v for k, v in os.environ.items() if k.startswith('_PYI')}))\n")
+              subprocess.run(["pyinstaller", "--onefile", "--distpath", "probe", "--workpath", "probe/build",
+                              "--specpath", "probe", "probe.py"], check=True, capture_output=True)
+              inherited = json.loads(subprocess.run([r"probe\probe.exe"], capture_output=True, text=True,
+                                                    check=True).stdout)
+              inherited["_PYI_ARCHIVE_FILE"] = exe      # after an update the new exe has the old one's path
+              ok, _, _ = launch([exe], dict(os.environ, **inherited))
+              annotate("notice", f"restart with inherited {sorted(inherited)}: "
+                                 f"{'starts' if ok else 'fails (the v1.2/v1.3 bug)'}")
+              os.environ.update(inherited)
+              ok, alive, _ = launch([exe], gui.clean_env())
+              annotate("notice" if ok else "error", f"restart with clean_env(): {'starts' if ok else 'fails'}")
+              sys.exit(0 if ok else 1)
+          except Exception:
+              annotate("error", traceback.format_exc()[-1500:])
+              sys.exit(1)
       - uses: actions/upload-artifact@v4
         with:
           name: PingMon
