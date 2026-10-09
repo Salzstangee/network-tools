@@ -338,11 +338,14 @@ def claim_instance():
 
 
 def version_tuple(tag):
-    """'v1.10' -> (1, 10), so 1.10 sorts after 1.9; junk sorts lowest."""
+    """'v1.10' -> (1, 10), so 1.10 sorts after 1.9; 1.6.0 equals 1.6; junk sorts lowest."""
     try:
-        return tuple(int(p) for p in tag.strip().lstrip("vV").split("."))
+        parts = [int(p) for p in tag.strip().lstrip("vV").split(".")]
     except ValueError:
         return (0,)
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 def fetch(url, method="GET", timeout=15):

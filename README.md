@@ -72,6 +72,8 @@ new tray icons sit behind the `^` arrow until you drag them out once.
   the tray needs `pip install pystray pillow`, everything else is standard library
 - `PingMon.exe`: built by GitHub Actions on every push to `main` (download it
   from the run's artifacts), attached to the release when a `v*` tag is pushed.
+  Versions are `MAJOR.MINOR.PATCH` (`v1.5.1` fixes, `v1.6.0` features); the tag
+  must equal `VERSION` in `pingmon_gui.pyw`, which the build checks.
 - Build locally on Windows:
   `pip install pyinstaller pystray pillow`, then
   `pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico --hidden-import pystray._win32 pingmon_gui.pyw`
