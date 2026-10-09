@@ -35,7 +35,7 @@ except Exception:       # not installed, or no usable tray backend (pystray rais
     pystray = None
 
 APP = "PingMon"
-VERSION = "1.3"
+VERSION = "1.4"
 IS_WINDOWS = sys.platform == "win32"
 REPO = "https://github.com/Salzstangee/network-tools"
 SELF_UPDATE = IS_WINDOWS and getattr(sys, "frozen", False)    # only the exe can swap itself
@@ -374,12 +374,24 @@ def update_script(new_name, name):
     return "\r\n".join(lines) + "\r\n"
 
 
+def clean_env():
+    """Our environment minus the onefile exe's own PyInstaller state (_PYI_*).
+
+    Inherited, it makes the restarted PingMon.exe (same path) take itself for our child
+    and load python312.dll from our temp folder, which is deleted by then.
+    """
+    mei = getattr(sys, "_MEIPASS", "")
+    return {k: v for k, v in os.environ.items()
+            if not k.upper().startswith(("_PYI", "_MEIPASS"))
+            and not (mei and k.upper() in ("TCL_LIBRARY", "TK_LIBRARY") and v.startswith(mei))}
+
+
 def stage_update(new_file):
     folder, name = os.path.split(sys.executable)
     script = os.path.join(tempfile.gettempdir(), "pingmon_update.cmd")
     with open(script, "w", encoding="oem", newline="") as fh:   # cmd reads the OEM codepage
         fh.write(update_script(os.path.basename(new_file), name))
-    subprocess.Popen(["cmd", "/c", script], cwd=folder, stdin=subprocess.DEVNULL,
+    subprocess.Popen(["cmd", "/c", script], cwd=folder, env=clean_env(), stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      creationflags=0x08000000)    # CREATE_NO_WINDOW
 
