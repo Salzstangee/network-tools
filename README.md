@@ -51,6 +51,10 @@ a host is down; click it to open the window, right-click for Exit. Settings are
 kept in `~/.pingmon_settings.json`. Starting PingMon a second time just brings
 the running one to the front.
 
+*Help → Check for Updates* compares with the latest release; *Update Now* downloads
+it, swaps `PingMon.exe` in place and restarts (autostart keeps working). PingMon also
+checks quietly at startup and notes a new version in the event log.
+
 Put `PingMon.exe` in a fixed folder (e.g. `%LOCALAPPDATA%\PingMon`) before
 enabling autostart, since the Run entry points at that exact path. On Windows 11
 new tray icons sit behind the `^` arrow until you drag them out once.

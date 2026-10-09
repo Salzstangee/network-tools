@@ -11,11 +11,15 @@ import json
 import os
 import queue
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.request
+import webbrowser
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -30,13 +34,16 @@ except Exception:       # not installed, or no usable tray backend (pystray rais
     pystray = None
 
 APP = "PingMon"
-VERSION = "1.1"
+VERSION = "1.2"
 IS_WINDOWS = sys.platform == "win32"
+REPO = "https://github.com/Salzstangee/network-tools"
+SELF_UPDATE = IS_WINDOWS and getattr(sys, "frozen", False)    # only the exe can swap itself
 SETTINGS_FILE = os.path.expanduser("~/.pingmon_settings.json")
 INSTANCE_PORT = 47231   # loopback port that keeps PingMon single-instance
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 DEFAULTS = {"autostart": False, "start_minimized": True, "close_to_tray": False,
-            "notify": True, "interval": 1.0, "beep": False, "on_top": False}
+            "notify": True, "interval": 1.0, "beep": False, "on_top": False,
+            "check_updates": True}
 REFRESH_MS = 250        # UI poll rate
 GRAPH_POINTS = 600      # samples kept per host (feeds the graph and the wide loss strip)
 GRAPH_WINDOW = 300      # samples the RTT graph spreads across its full width
@@ -291,6 +298,55 @@ def claim_instance():
     return False    # port taken by something else: run without the single-instance guard
 
 
+def version_tuple(tag):
+    """'v1.10' -> (1, 10), so 1.10 sorts after 1.9; junk sorts lowest."""
+    try:
+        return tuple(int(p) for p in tag.strip().lstrip("vV").split("."))
+    except ValueError:
+        return (0,)
+
+
+def fetch(url, method="GET", timeout=15):
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": f"{APP}/{VERSION}"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def latest_release():
+    """Tag of the newest release, read from where /releases/latest redirects (no API rate limit)."""
+    with fetch(f"{REPO}/releases/latest", "HEAD") as resp:
+        url = resp.geturl()
+    if "/releases/tag/" not in url:
+        raise OSError("no release published yet")
+    return url.rstrip("/").rsplit("/", 1)[1]
+
+
+def update_script(new_name, name):
+    """cmd script that swaps the downloaded exe in once PingMon has exited, then starts it.
+
+    A running exe can't be overwritten, so the move retries until the old process is gone.
+    """
+    q = lambda s: s.replace("%", "%%")
+    lines = ["@echo off", "set n=0", ":retry",
+             f'move /y "{q(new_name)}" "{q(name)}" >nul 2>&1 && goto ok',
+             "set /a n+=1", "if %n% geq 30 goto fail",
+             "ping -n 2 127.0.0.1 >nul",       # 1s sleep; timeout.exe refuses to run without a console
+             "goto retry",
+             ":ok", f'start "" "{q(name)}" --updated', "goto end",
+             ":fail", f'start "" "{q(name)}"',
+             ":end", '(goto) 2>nul & del "%~f0"']
+    return "\r\n".join(lines) + "\r\n"
+
+
+def stage_update(new_file):
+    folder, name = os.path.split(sys.executable)
+    script = os.path.join(tempfile.gettempdir(), "pingmon_update.cmd")
+    with open(script, "w", encoding="oem", newline="") as fh:   # cmd reads the OEM codepage
+        fh.write(update_script(os.path.basename(new_file), name))
+    subprocess.Popen(["cmd", "/c", script], cwd=folder, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=0x08000000)    # CREATE_NO_WINDOW
+
+
 def tray_image(alert):
     """The app icon for the tray; the screen turns red while any host is down."""
     pal = dict(PALETTE)
@@ -327,6 +383,8 @@ class ToolButton(tk.Label):
 class Dialog(tk.Toplevel):
     """Modal grey box with the parent's icon."""
 
+    SEG_W, SEG_GAP, BAR_W = 8, 2, 300
+
     def __init__(self, parent, title):
         super().__init__(parent, bg=FACE)
         self.withdraw()
@@ -349,11 +407,23 @@ class Dialog(tk.Toplevel):
         self.grab_release()
         self.destroy()
 
+    def make_bar(self, parent):
+        self.bar = tk.Canvas(parent, width=self.BAR_W, height=18, bg=FACE,
+                             highlightthickness=0, bd=2, relief="sunken")
+        return self.bar
+
+    def draw_bar(self, frac):
+        """Segmented navy progress bar, the Win9x file-copy kind."""
+        self.bar.delete("all")
+        step = self.SEG_W + self.SEG_GAP
+        segs = int((self.BAR_W - 2) * frac) // step
+        for i in range(segs):
+            x = 3 + i * step
+            self.bar.create_rectangle(x, 4, x + self.SEG_W - 1, 17, fill=NAVY, outline="")
+
 
 class SweepDialog(Dialog):
     """Sweeps one or more networks with a segmented Win9x progress bar."""
-
-    SEG_W, SEG_GAP, BAR_W = 8, 2, 300
 
     def __init__(self, app, networks):
         super().__init__(app.root, "Network Sweep")
@@ -371,9 +441,7 @@ class SweepDialog(Dialog):
         self.title_lbl.grid(row=0, column=1, sticky="w")
         self.info_lbl = tk.Label(body, text="", bg=FACE, font=app.ui_font, anchor="w")
         self.info_lbl.grid(row=1, column=1, sticky="w", pady=(2, 8))
-        self.bar = tk.Canvas(body, width=self.BAR_W, height=18, bg=FACE,
-                             highlightthickness=0, bd=2, relief="sunken")
-        self.bar.grid(row=2, column=0, columnspan=2)
+        self.make_bar(body).grid(row=2, column=0, columnspan=2)
         self.btn = tk.Button(body, text="Cancel", width=10, font=app.ui_font,
                              bg=FACE, activebackground=FACE, command=self.on_button)
         self.btn.grid(row=3, column=0, columnspan=2, pady=(12, 0))
@@ -420,14 +488,6 @@ class SweepDialog(Dialog):
         else:
             self.after(100, self.poll)
 
-    def draw_bar(self, frac):
-        self.bar.delete("all")
-        step = self.SEG_W + self.SEG_GAP
-        segs = int((self.BAR_W - 2) * frac) // step
-        for i in range(segs):
-            x = 3 + i * step
-            self.bar.create_rectangle(x, 4, x + self.SEG_W - 1, 17, fill=NAVY, outline="")
-
     def finish(self):
         core.save()
         for h in self.found:
@@ -472,6 +532,150 @@ class AboutDialog(Dialog):
         self.bind("<Return>", lambda e: self.close())
         self.bind("<Escape>", lambda e: self.close())
         self.show()
+
+
+class UpdateDialog(Dialog):
+    """Help > Check for Updates: compare with the latest release, download it, swap the exe."""
+
+    def __init__(self, app):
+        super().__init__(app.root, "Check for Updates")
+        self.app = app
+        self.tag = None
+        self.cancel = threading.Event()
+        self.results = queue.Queue()     # from the worker threads, handled in poll()
+
+        body = tk.Frame(self, bg=FACE, padx=12, pady=10)
+        body.pack()
+        tk.Label(body, image=app.big_icon, bg=FACE).grid(row=0, column=0, rowspan=2,
+                                                         sticky="n", padx=(0, 12))
+        self.title_lbl = tk.Label(body, text="Checking for updates...", bg=FACE,
+                                  font=app.ui_bold, anchor="w")
+        self.title_lbl.grid(row=0, column=1, sticky="w")
+        self.info_lbl = tk.Label(body, text=f"Asking GitHub for the latest release.\n"
+                                            f"You are running version {VERSION}.",
+                                 bg=FACE, justify="left", anchor="w", wraplength=340)
+        self.info_lbl.grid(row=1, column=1, sticky="w", pady=(2, 8))
+        body.grid_columnconfigure(1, minsize=340)    # fixed width: the box must not jump per step
+        self.make_bar(body).grid(row=2, column=0, columnspan=2)
+        self.bar.grid_remove()
+        self.btns = tk.Frame(body, bg=FACE)
+        self.btns.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+        self.buttons(("Cancel", self.close))
+        self.bind("<Escape>", lambda e: self.close())
+        self.show()
+        threading.Thread(target=self.check, daemon=True).start()
+        self.poll()
+
+    def buttons(self, *specs):
+        for w in self.btns.winfo_children():
+            w.destroy()
+        for i, (text, cmd) in enumerate(specs):
+            tk.Button(self.btns, text=text, width=12, bg=FACE, activebackground=FACE,
+                      default="active" if i == 0 else "normal", command=cmd).pack(side="left", padx=4)
+        self.bind("<Return>", lambda e: specs[0][1]())
+
+    def check(self):
+        try:
+            self.results.put(("latest", latest_release()))
+        except Exception as e:
+            self.results.put(("error", "Update check failed", f"GitHub could not be reached:\n{e}"))
+
+    def download(self, dest):
+        url = f"{REPO}/releases/download/{self.tag}/PingMon.exe"
+        try:
+            with fetch(url, timeout=30) as resp, open(dest, "wb") as fh:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                while not self.cancel.is_set():
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    self.results.put(("progress", done, total))
+            if self.cancel.is_set():
+                raise OSError("cancelled")
+            with open(dest, "rb") as fh:
+                is_exe = fh.read(2) == b"MZ"
+            if (total and done != total) or done < 1_000_000 or not is_exe:
+                raise OSError(f"incomplete file ({done} bytes)")
+        except Exception as e:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            self.results.put(("error", "Download failed", str(e)))
+            return
+        self.results.put(("downloaded", dest))
+
+    def poll(self):
+        if not self.winfo_exists():
+            return
+        while not self.results.empty():
+            kind, *args = self.results.get_nowait()
+            getattr(self, "on_" + kind)(*args)
+        self.after(100, self.poll)
+
+    def on_latest(self, tag):
+        self.tag = tag
+        if version_tuple(tag) <= version_tuple(VERSION):
+            self.title_lbl.config(text=f"{APP} is up to date")
+            self.info_lbl.config(text=f"Version {VERSION} is the latest release.")
+            self.buttons(("OK", self.close))
+            return
+        self.title_lbl.config(text=f"Version {tag.lstrip('vV')} is available")
+        if SELF_UPDATE:
+            self.info_lbl.config(text=f"You are running version {VERSION}.\n\n"
+                                      f"Update Now downloads it, replaces\n{sys.executable}\n"
+                                      "and restarts PingMon. Targets and settings are kept.")
+            self.buttons(("Update Now", self.start_download), ("Release Page", self.open_page),
+                         ("Later", self.close))
+        else:
+            self.info_lbl.config(text=f"You are running version {VERSION} from source.\n"
+                                      "Get the new files from the release page or git.")
+            self.buttons(("Release Page", self.open_page), ("Close", self.close))
+
+    def start_download(self):
+        self.title_lbl.config(text=f"Downloading {APP} {self.tag.lstrip('vV')}")
+        self.info_lbl.config(text="Connecting...")
+        self.bar.grid()
+        self.draw_bar(0)
+        self.buttons(("Cancel", self.close))
+        threading.Thread(target=self.download, args=(sys.executable + ".new",),
+                         daemon=True).start()
+
+    def on_progress(self, done, total):
+        mb = 1024 * 1024
+        self.info_lbl.config(text=f"{done / mb:.1f} of {total / mb:.1f} MB received"
+                             if total else f"{done / mb:.1f} MB received")
+        self.draw_bar(done / total if total else 0)
+
+    def on_downloaded(self, path):
+        try:
+            stage_update(path)
+        except (OSError, UnicodeError) as e:
+            self.on_error("Update failed", f"Could not install the new version:\n{e}")
+            return
+        self.title_lbl.config(text=f"Restarting {APP}...")
+        self.info_lbl.config(text="The new version starts in a moment.")
+        self.buttons()
+        self.after(500, self.app.quit)
+
+    def on_error(self, title, text):
+        if self.cancel.is_set():
+            return
+        self.title_lbl.config(text=title)
+        self.info_lbl.config(text=text[:300])
+        self.bar.grid_remove()
+        self.buttons(("Release Page", self.open_page), ("Close", self.close))
+
+    def open_page(self):
+        webbrowser.open(f"{REPO}/releases/tag/{self.tag}" if self.tag else f"{REPO}/releases")
+        self.close()
+
+    def close(self):
+        self.cancel.set()
+        super().close()
 
 
 class App:
@@ -520,6 +724,7 @@ class App:
         self.v_minimized = tk.BooleanVar(value=st["start_minimized"])
         self.v_close_tray = tk.BooleanVar(value=st["close_to_tray"])
         self.v_notify = tk.BooleanVar(value=st["notify"])
+        self.v_updates = tk.BooleanVar(value=st["check_updates"])
         root.attributes("-topmost", self.on_top.get())
 
         self.build_menu()
@@ -540,6 +745,10 @@ class App:
             self.log("autostart entry updated to this program's location", AMBER)
         if "--autostart" in sys.argv and st["start_minimized"] and self.tray:
             root.withdraw()
+        if "--updated" in sys.argv:
+            self.log(f"updated to version {VERSION}", AMBER)
+        if st["check_updates"]:
+            threading.Thread(target=self.quiet_update_check, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
 
@@ -597,12 +806,17 @@ class App:
                            variable=self.v_close_tray, command=self.persist, state=tray)
         st.add_checkbutton(label="Tray Notification on Host Down", underline=0,
                            variable=self.v_notify, command=self.persist, state=tray)
+        st.add_separator()
+        st.add_checkbutton(label="Check for Updates on Startup", underline=10,
+                           variable=self.v_updates, command=self.persist)
         if not pystray:
             st.add_separator()
             st.add_command(label="(tray needs: pip install pystray pillow)", state="disabled")
         m.add_cascade(label="Settings", underline=0, menu=st)
 
         h = tk.Menu(m)
+        h.add_command(label="Check for Updates...", underline=0, command=lambda: UpdateDialog(self))
+        h.add_separator()
         h.add_command(label=f"About {APP}...", underline=0, command=lambda: AboutDialog(self))
         m.add_cascade(label="Help", underline=0, menu=h)
         self.root.config(menu=m)
@@ -820,7 +1034,8 @@ class App:
         self.settings.update(interval=core.INTERVAL, on_top=self.on_top.get(),
                              beep=self.beep.get(), autostart=self.v_autostart.get(),
                              start_minimized=self.v_minimized.get(),
-                             close_to_tray=self.v_close_tray.get(), notify=self.v_notify.get())
+                             close_to_tray=self.v_close_tray.get(), notify=self.v_notify.get(),
+                             check_updates=self.v_updates.get())
         save_settings(self.settings)
 
     def toggle_autostart(self):
@@ -844,6 +1059,15 @@ class App:
             return
         self.log("start with Windows " + ("enabled" if on else "disabled"), AMBER)
         self.persist()
+
+    def quiet_update_check(self):
+        time.sleep(10)      # after a Windows logon the network may not be up yet
+        try:
+            tag = latest_release()
+        except Exception:
+            return
+        if version_tuple(tag) > version_tuple(VERSION):
+            self.events.put(("update", tag))
 
     # ---- tray / window ---------------------------------------------------
 
@@ -1002,6 +1226,9 @@ class App:
                 return
             if ev == "show":
                 self.show_window()
+            elif ev[0] == "update":
+                self.log(f"version {ev[1].lstrip('vV')} is available - Help > Check for Updates",
+                         AMBER)
         with core.lock:
             items = [(h, dict(t, hist=list(t["hist"]))) for h, t in core.targets.items()]
         live = {h for h, _ in items}
