@@ -609,7 +609,7 @@ class UpdateDialog(Dialog):
         for i, (text, cmd) in enumerate(specs):
             tk.Button(self.btns, text=text, width=12, bg=FACE, activebackground=FACE,
                       default="active" if i == 0 else "normal", command=cmd).pack(side="left", padx=4)
-        self.bind("<Return>", lambda e: specs[0][1]())
+        self.bind("<Return>", (lambda e: specs[0][1]()) if specs else "")
 
     def check(self):
         try:

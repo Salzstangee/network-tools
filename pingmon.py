@@ -10,7 +10,7 @@ Commands (type at the > prompt):
   clear all                     remove every target
   list                          show status table once
   watch                         live table, refreshes until you press Enter
-  interval <sec>                change ping interval (default 5s)
+  interval <sec>                change ping interval (default 1s)
   help                          show this
   quit                          exit
 """

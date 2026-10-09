@@ -44,6 +44,13 @@ Task-Manager-style RTT graph for the selected host, event log of up/down
 changes, network sweep with progress bar, beep on outage, always-on-top. It
 shares `~/.pingmon_targets` with the console version, which stays as it is.
 
+One lost ping shows as orange **LOST** (and in the event log); two in a row make
+the host **DOWN**: red, beep, tray notification, red tray icon. Yellow **SLOW**
+marks replies above *View → Slow Threshold*. The DNS column fills itself in
+(reverse name of an IP, address of a hostname). Double-click a host, or
+right-click → *Host Info* (Alt+Enter), for DNS in both directions, TTL with an
+OS guess, RTT/jitter/outage statistics and a trace route.
+
 **Settings** menu (GUI only): *Start with Windows* (per-user `HKCU\...\Run` entry,
 no admin), *Start Minimized to Tray*, *Close to Tray* (keeps monitoring in the
 background) and *Tray Notification on Host Down*. The tray icon turns red while
@@ -76,6 +83,7 @@ configuration and "How it works" apply to both versions.
 
 - Python 3.6+ (no third-party packages)
 - A working `ping` binary in `PATH` — the system one is called as a subprocess
+  (on Windows only for IPv6; IPv4 goes straight through the ICMP API)
 
 Runs on Linux, macOS, WSL, and Windows; the ping flags and output parsing are
 switched per platform (including German-locale `Zeit=` output).
@@ -101,7 +109,7 @@ Typed at the `>` prompt:
 
 | Command | Aliases | What it does |
 |---|---|---|
-| `add <ip\|host\|cidr> [...]` | `a` | Add targets. CIDRs are swept — see below |
+| `add <ip\|host\|host:port\|cidr> [...]` | `a` | Add targets. CIDRs are swept — see below |
 | `del <ip\|host\|#> [...]` | `d`, `rm`, `remove` | Remove targets by name or by table number |
 | `clear` | `c` | Remove every target **except the first one** |
 | `clear all` | `c all` | Remove every target |
@@ -128,7 +136,9 @@ Arguments are space-separated, and you can mix forms freely:
   added 8.8.8.8
 ```
 
-Hostnames work anywhere an IP does. Commas are **not** separators — `add a,b`
+Hostnames work anywhere an IP does. `host:port` (`10.20.30.5:443`, `[::1]:22`)
+is checked with a TCP connect instead of a ping, for hosts that drop ICMP; the
+connect time shows as RTT. Commas are **not** separators — `add a,b`
 is treated as one host named `a,b`. Adding a host that is already listed leaves
 the existing entry (and its state history) untouched.
 
@@ -242,7 +252,8 @@ sweep time scales with `hosts / workers`.
 
 ## Limitations
 
-- ICMP only — no TCP-port or ARP-based discovery, so firewalled hosts look down.
+- Sweeps are ICMP only, so firewalled hosts are not found; add them as
+  `host:port` to monitor them by TCP instead.
 - IPv4-oriented in practice; IPv6 addresses work as plain targets, but sweeping
   an IPv6 prefix is not useful and will hit the size limit immediately.
 - No logging or alerting — state lives in memory and is lost on exit, loss
