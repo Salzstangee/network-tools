@@ -267,3 +267,10 @@ sweep time scales with `hosts / workers`.
   tight.
 - On most systems the unprivileged `ping` binary is used, so no raw-socket
   permissions are needed, but very locked-down images may not ship one.
+
+## License
+
+MIT, see [LICENSE](LICENSE): free to use, change and pass on, also commercially, as
+long as the copyright notice stays. `PingMon.exe` additionally bundles Python (PSF
+License), Tcl/Tk (BSD-style), Pillow (MIT-CMU) and pystray (LGPL-3.0); all of their
+sources are public, and the exe can be rebuilt from this repo with any version of them.

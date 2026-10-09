@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Salzstangee - MIT License, see LICENSE
 """PingMon for Windows - a Win9x-style GUI on top of pingmon.py.
 
 Same engine, same target file (~/.pingmon_targets) as the console version;
@@ -572,7 +573,7 @@ class AboutDialog(Dialog):
         rows = [(f"{APP} for Windows", app.ui_bold),
                 (f"Version {VERSION}", app.ui_font),
                 ("Interactive ICMP network monitor", app.ui_font),
-                (f"Copyright (C) {datetime.now().year}", app.ui_font)]
+                ("Copyright (C) 2026 Salzstangee - MIT License", app.ui_font)]
         for i, (text, font) in enumerate(rows):
             tk.Label(body, text=text, bg=FACE, font=font, anchor="w").grid(
                 row=i, column=1, sticky="w")
