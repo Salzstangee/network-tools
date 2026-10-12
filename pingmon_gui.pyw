@@ -38,7 +38,7 @@ except Exception:       # not installed, or no usable tray backend (pystray rais
     pystray = None
 
 APP = "PingMon"
-VERSION = "1.5"
+VERSION = "1.5.1"
 IS_WINDOWS = sys.platform == "win32"
 REPO = "https://github.com/Salzstangee/network-tools"
 SELF_UPDATE = IS_WINDOWS and getattr(sys, "frozen", False)    # only the exe can swap itself
