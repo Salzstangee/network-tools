@@ -47,7 +47,7 @@ jobs:
       - name: Smoke test the GUI module
         shell: python
         run: |
-          import importlib.machinery, importlib.util, sys
+          import importlib.machinery, importlib.util, socket, sys
           sys.path.insert(0, ".")
           loader = importlib.machinery.SourceFileLoader("gui", "pingmon_gui.pyw")
           gui = importlib.util.module_from_spec(importlib.util.spec_from_loader("gui", loader))
@@ -58,6 +58,17 @@ jobs:
           gw, lo = gui.next_hop("8.8.8.8"), gui.next_hop("127.0.0.1")
           print(f"::notice::next hop to 8.8.8.8: {gw}, to 127.0.0.1: {lo}")
           assert gw and gw != "8.8.8.8" and lo is None, (gw, lo)
+          preset = gui.local_preset()
+          print(f"::notice::Local Network preset: {preset}")
+          assert gui.dns_servers(), "DNS servers from GetNetworkParams"
+          assert preset[0][0] == gw, preset
+          srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen()
+          gone = socket.socket(); gone.bind(("127.0.0.1", 0)); closed = gone.getsockname()[1]; gone.close()
+          assert gui.probe_port("127.0.0.1", srv.getsockname()[1])[0] == "open"
+          assert gui.probe_port("127.0.0.1", closed)[0] == "closed", "refused, not timed out"
+          mtu = gui.find_mtu("127.0.0.1", lambda size, ok: None)
+          print(f"::notice::MTU to loopback: {mtu}")
+          assert mtu in (1500, 9000), mtu
           print("gui ok", gui.VERSION, gui.dns_name("127.0.0.1"))
       - run: pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico --hidden-import pystray._win32 pingmon_gui.pyw
       - name: Smoke test the exe, also as restarted by an update

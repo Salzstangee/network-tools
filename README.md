@@ -51,7 +51,21 @@ marks replies above *View → Slow Threshold*. The DNS column fills itself in
 right-click → *Host Info* (Alt+Enter), for where the pings go (address, next hop,
 local address; works for offline hosts too), TTL with an OS guess, RTT/jitter/outage
 statistics, DNS in both directions, and a trace route that runs alongside and gives
-up after 3 silent hops.
+up after 3 silent hops. Two buttons there run on demand: *Scan Ports* tries 37 common
+TCP ports (open, refused or silent, plus the banner of services that introduce
+themselves), *Find MTU* searches for the largest IPv4 packet that gets through with
+Don't Fragment set and names the usual suspects (1492 = PPPoE).
+
+*Targets → Add Preset*: **Internet** adds Cloudflare, Google and Quad9 by IP, `google.com`
+by name (DOWN only there means DNS trouble) and Cloudflare over IPv6 (left out when the PC
+has no IPv6 route); **Local Network** adds this PC's default gateway and DNS servers.
+Together they show whether a problem sits in the LAN, at the router or beyond.
+
+**Mini mode** (*View → Mini Mode*, Ctrl+M, toolbar *Mini* or the tray menu) swaps the window
+for a small always-on-top list: status, RTT and the last 12 pings per host, with a caption
+that turns red while a host is down. Drag it anywhere; double-click a host or the caption
+button for the full window. PingMon remembers where it was and starts in mini mode if you
+quit in it.
 
 **Settings** menu (GUI only): *Start with Windows* (per-user `HKCU\...\Run` entry,
 no admin), *Start Minimized to Tray*, *Close to Tray* (keeps monitoring in the

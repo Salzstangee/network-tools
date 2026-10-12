@@ -38,7 +38,7 @@ except Exception:       # not installed, or no usable tray backend (pystray rais
     pystray = None
 
 APP = "PingMon"
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 IS_WINDOWS = sys.platform == "win32"
 REPO = "https://github.com/Salzstangee/network-tools"
 SELF_UPDATE = IS_WINDOWS and getattr(sys, "frozen", False)    # only the exe can swap itself
@@ -47,7 +47,7 @@ INSTANCE_PORT = 47231   # loopback port that keeps PingMon single-instance
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 DEFAULTS = {"autostart": False, "start_minimized": True, "close_to_tray": False,
             "notify": True, "interval": 1.0, "beep": False, "on_top": False,
-            "check_updates": True, "slow_ms": 100}
+            "check_updates": True, "slow_ms": 100, "mini": False, "mini_pos": None}
 REFRESH_MS = 250        # UI poll rate
 GRAPH_POINTS = 600      # samples kept per host (feeds the graph and the wide loss strip)
 GRAPH_WINDOW = 300      # samples the RTT graph spreads across its full width
@@ -211,6 +211,23 @@ ICONS = {
         "..kwwwbbbbwwwk..",
         "...kkwwwwwwkk...",
         ".....kkkkkk.....",
+        "................",
+        "................"],
+    "mini": [
+        "................",
+        "................",
+        ".kkkkkkkkkkkkkk.",
+        ".knnnnnnnnnnlnk.",
+        ".knnnnnnnnnnnnk.",
+        ".kkkkkkkkkkkkkk.",
+        ".kkkkkkkkkkkkkk.",
+        ".kkGkdddddddkkk.",
+        ".kkkkkkkkkkkkkk.",
+        ".kkGkdddddkkkkk.",
+        ".kkkkkkkkkkkkkk.",
+        ".kkRkdddddddkkk.",
+        ".kkkkkkkkkkkkkk.",
+        ".kkkkkkkkkkkkkk.",
         "................",
         "................"],
 }
@@ -783,6 +800,141 @@ def next_hop(addr):
     return via.group(1) if via else None
 
 
+def local_address(addr):
+    """This PC's own address towards addr, or None without a route. Connecting a UDP
+    socket sends nothing; it only asks the routing table."""
+    try:
+        with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET,
+                           socket.SOCK_DGRAM) as s:
+            s.connect((addr, 9))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def dns_servers():
+    """DNS servers this PC asks: GetNetworkParams on Windows (IPv4), resolv.conf elsewhere."""
+    if IS_WINDOWS:
+        import ctypes
+
+        class AddrString(ctypes.Structure):     # IP_ADDR_STRING, a linked list
+            pass
+        AddrString._fields_ = [("next", ctypes.POINTER(AddrString)), ("addr", ctypes.c_char * 16),
+                               ("mask", ctypes.c_char * 16), ("context", ctypes.c_ulong)]
+
+        class FixedInfo(ctypes.Structure):      # FIXED_INFO
+            _fields_ = [("host", ctypes.c_char * 132), ("domain", ctypes.c_char * 132),
+                        ("current", ctypes.POINTER(AddrString)), ("dns", AddrString),
+                        ("node_type", ctypes.c_uint), ("scope", ctypes.c_char * 260),
+                        ("routing", ctypes.c_uint), ("proxy", ctypes.c_uint),
+                        ("enable_dns", ctypes.c_uint)]
+        size = ctypes.c_ulong(0)
+        ctypes.windll.iphlpapi.GetNetworkParams(None, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(max(size.value, ctypes.sizeof(FixedInfo)))
+        if ctypes.windll.iphlpapi.GetNetworkParams(buf, ctypes.byref(size)):
+            return []
+        found, node = [], ctypes.cast(buf, ctypes.POINTER(FixedInfo)).contents.dns
+        while True:
+            found.append(node.addr.decode("ascii", "replace"))
+            if not node.next:
+                break
+            node = node.next.contents
+    else:
+        try:
+            with open("/etc/resolv.conf") as fh:
+                found = [w[1] for w in (line.split() for line in fh)
+                         if len(w) > 1 and w[0] == "nameserver"]
+        except OSError:
+            found = []
+    servers = []
+    for s in found:
+        try:
+            ip = ipaddress.ip_address(s.split("%")[0])
+        except ValueError:
+            continue
+        if not (ip.is_loopback or ip.is_unspecified) and s not in servers:   # 127.0.0.53 stub
+            servers.append(s)
+    return servers
+
+
+PRESETS = {     # Targets > Add Preset: (target, why it is there)
+    "Internet": [("1.1.1.1", "Cloudflare"), ("8.8.8.8", "Google"), ("9.9.9.9", "Quad9"),
+                 ("google.com", "by name, so DNS is tested too"),
+                 ("2606:4700:4700::1111", "Cloudflare over IPv6")],
+}
+
+
+def local_preset():
+    """Targets > Add Preset > Local Network: this PC's default gateway and DNS servers."""
+    try:
+        gw = next_hop("8.8.8.8")    # where traffic to the internet leaves; nothing is sent
+    except (OSError, ValueError, subprocess.SubprocessError):
+        gw = None
+    try:
+        dns = dns_servers()
+    except (OSError, ValueError, AttributeError):
+        dns = []
+    gateway = [(gw, "default gateway" + (" and DNS server" if gw in dns else ""))] if gw else []
+    return gateway + [(s, "DNS server") for s in dns if s != gw]
+
+
+SCAN_PORTS = {21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
+              88: "Kerberos", 110: "POP3", 135: "MS RPC", 139: "NetBIOS", 143: "IMAP",
+              389: "LDAP", 443: "HTTPS", 445: "SMB", 465: "SMTPS", 554: "RTSP (camera)",
+              587: "SMTP submission", 631: "IPP (printer)", 636: "LDAPS", 993: "IMAPS",
+              995: "POP3S", 1433: "MS SQL", 1723: "PPTP", 1883: "MQTT", 3306: "MySQL",
+              3389: "RDP", 5000: "Synology DSM", 5001: "Synology HTTPS", 5060: "SIP",
+              5432: "PostgreSQL", 5900: "VNC", 5985: "WinRM", 8006: "Proxmox", 8080: "HTTP alt",
+              8291: "MikroTik Winbox", 8443: "HTTPS alt", 9100: "printer (raw)"}
+
+
+def probe_port(addr, port, timeout=3.0):
+    """TCP connect to one port: ("open", ms, banner), ("closed", ..) on a reset, or
+    ("filtered", ..) without any answer. Windows retries a refused connect for about 2s,
+    hence the long timeout."""
+    with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET,
+                       socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        start = time.perf_counter()
+        try:
+            s.connect((addr, port))
+        except ConnectionRefusedError:
+            return "closed", None, ""
+        except OSError:
+            return "filtered", None, ""
+        ms = (time.perf_counter() - start) * 1000
+        s.settimeout(0.8)       # SSH, FTP, SMTP, ... introduce themselves unasked
+        try:
+            banner = s.recv(128).decode("ascii", "replace").strip()
+        except OSError:
+            banner = ""
+    banner = "".join(ch for ch in banner.splitlines()[0] if ch.isprintable()) if banner else ""
+    return "open", ms, banner[:48]
+
+
+MTU_NOTES = {9000: "jumbo frames all the way", 1500: "standard Ethernet",
+             1492: "PPPoE, typical for DSL", 1420: "WireGuard tunnel"}
+
+
+def find_mtu(addr, report):
+    """Path MTU to an IPv4 address: pings with Don't Fragment set, binary search on the size.
+    report(payload, ok) sees every probe. None if the host does not answer at all."""
+    def fits(size):
+        ok = core.echo(addr, size, True)[0] or core.echo(addr, size, True)[0]   # 1 loss != too big
+        report(size, ok)
+        return ok
+
+    if not fits(32):
+        return None
+    if fits(1472):          # 1472 + 28 bytes of IP and ICMP header = 1500
+        return 9000 if fits(8972) else 1500
+    lo, hi = 32, 1472       # lo gets through, hi doesn't
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if fits(mid) else (lo, mid)
+    return lo + 28
+
+
 class Console:
     """One phosphor output pane of the Host Info window, written to from a worker thread."""
 
@@ -806,15 +958,17 @@ class Console:
         self.busy = False               # ... and None when the job ends
         self.sections = 0
 
-    def start(self, status, job, *args):
-        """Clear the pane and run job(*args) in a thread."""
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        for mark in self.text.mark_names():
-            if mark.startswith("line:"):
-                self.text.mark_unset(mark)
-        self.text.configure(state="disabled")
-        self.busy, self.sections = True, 0
+    def start(self, status, job, *args, clear=True):
+        """Run job(*args) in a thread, in a cleared pane unless clear=False (append)."""
+        if clear:
+            self.text.configure(state="normal")
+            self.text.delete("1.0", "end")
+            for mark in self.text.mark_names():
+                if mark.startswith("line:"):
+                    self.text.mark_unset(mark)
+            self.text.configure(state="disabled")
+            self.sections = 0
+        self.busy = True
         self.box.config(text=f" {self.title} - {status} ")
         threading.Thread(target=self.work, args=(job, args), daemon=True).start()
 
@@ -865,8 +1019,12 @@ class Console:
     def append(self, key, text):
         self.lines.put(("append", key, text))
 
+    def segs(self, *parts):
+        """One line from (text, tag) parts."""
+        self.lines.put(("line", list(parts), None))
+
     def kv(self, key, value, tag="val"):
-        self.lines.put(("line", [(f"{key} ".ljust(19, "."), "key"), (f" {value}", tag)], None))
+        self.segs((f"{key} ".ljust(19, "."), "key"), (f" {value}", tag))
 
     def section(self, title):
         if self.sections:
@@ -876,7 +1034,8 @@ class Console:
 
 
 class HostInfo(tk.Toplevel):
-    """Host Info window: where the pings go, DNS, what the monitor saw; a trace route beside it."""
+    """Host Info window: where the pings go, DNS, what the monitor saw; a trace route beside it,
+    port scan and MTU search on demand."""
 
     DEAD_HOPS = 3       # the trace gives up after this many silent hops in a row
 
@@ -887,10 +1046,11 @@ class HostInfo(tk.Toplevel):
         self.proc = None
         self.trace_stop = threading.Event()
         self.namer = ThreadPoolExecutor(max_workers=4)     # hop names, resolved beside the trace
+        self.tools_used = False
         self.title(f"Host Info - {target}")
         self.transient(app.root)    # stays above an always-on-top PingMon, hides with it
-        self.geometry("780x640")
-        self.minsize(480, 360)
+        self.geometry(f"780x{min(760, self.winfo_screenheight() - 80)}")
+        self.minsize(480, 420)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda e: self.close())
 
@@ -908,8 +1068,13 @@ class HostInfo(tk.Toplevel):
         pane.pack(fill="both", expand=True, padx=8)
         self.info = Console(pane, app, "Host Info")
         self.route = Console(pane, app, "Trace Route")
-        pane.add(self.info.box, minsize=120, height=330, stretch="always")
-        pane.add(self.route.box, minsize=100, stretch="always")
+        self.tools = Console(pane, app, "Ports & MTU")
+        pane.add(self.info.box, minsize=120, height=300, stretch="always")
+        pane.add(self.route.box, minsize=90, height=190, stretch="always")
+        pane.add(self.tools.box, minsize=90, stretch="always")
+        self.tools.out("Scan Ports  tries the usual TCP ports: which services answer.", "dim")
+        self.tools.out("Find MTU    looks for the biggest packet that gets through unfragmented.",
+                       "dim")
 
         def button(text, cmd, side="left"):
             b = tk.Button(btns, text=text, width=12, bg=FACE, activebackground=FACE, command=cmd)
@@ -917,6 +1082,8 @@ class HostInfo(tk.Toplevel):
             return b
         self.b_refresh = button("Refresh", self.refresh)
         self.b_trace = button("Trace Route", self.toggle_trace)
+        self.b_ports = button("Scan Ports", lambda: self.run_tool("scanning...", self.port_scan))
+        self.b_mtu = button("Find MTU", lambda: self.run_tool("searching...", self.mtu))
         button("Close", self.close, "right")
         button("Copy All", self.copy, "right")
         self.refresh()
@@ -926,10 +1093,12 @@ class HostInfo(tk.Toplevel):
     def poll(self):
         if not self.winfo_exists():
             return
-        self.info.drain()
-        self.route.drain()
+        for c in (self.info, self.route, self.tools):
+            c.drain()
         self.b_refresh.config(state="disabled" if self.info.busy else "normal")
         self.b_trace.config(text="Stop Trace" if self.route.busy else "Trace Route")
+        for b in (self.b_ports, self.b_mtu):
+            b.config(state="disabled" if self.tools.busy else "normal")
         self.after(80, self.poll)
 
     # ---- buttons ---------------------------------------------------------
@@ -949,6 +1118,12 @@ class HostInfo(tk.Toplevel):
             self.trace_stop.clear()
             self.route.start("running...", self.trace_route)
 
+    def run_tool(self, status, job):
+        """Port scan and MTU share one pane; results pile up there, the hint goes first."""
+        if not self.tools.busy:
+            self.tools.start(status, job, clear=not self.tools_used)
+            self.tools_used = True
+
     def stop_trace(self):
         self.trace_stop.set()
         proc = self.proc
@@ -961,7 +1136,7 @@ class HostInfo(tk.Toplevel):
     def copy(self):
         self.clipboard_clear()
         self.clipboard_append("\n\n".join(c.text.get("1.0", "end-1c")
-                                          for c in (self.info, self.route)))
+                                          for c in (self.info, self.route, self.tools)))
         self.note.config(text="Copied to the clipboard.")
 
     def close(self):
@@ -1031,12 +1206,8 @@ class HostInfo(tk.Toplevel):
         c = self.info
         c.kv("Pings go to", f"{addr}" + (f" port {self.port} (TCP)" if self.port else "")
              + f"  ({describe_ip(addr)})")
-        try:    # connecting a UDP socket sends nothing; it only asks the routing table
-            with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET,
-                               socket.SOCK_DGRAM) as s:
-                s.connect((addr, 9))
-                local = s.getsockname()[0]
-        except OSError:
+        local = local_address(addr)
+        if not local:
             c.kv("Route", "none - this PC has no route to that address", "bad")
             return
         if ":" not in addr:
@@ -1124,6 +1295,177 @@ class HostInfo(tk.Toplevel):
         if self.trace_stop.is_set():
             c.out("stopped", "warn")
 
+    def address(self, family=None):
+        """The target's first address (IPv4 preferred), or None if the name does not resolve."""
+        addrs = sorted(core.lookup(self.host), key=lambda a: a[0] != socket.AF_INET)
+        return next((a for fam, a in addrs if family in (None, fam)), None)
+
+    def port_scan(self):
+        c = self.tools
+        c.section(f"Port Scan  {datetime.now():%H:%M:%S}")
+        addr = self.address()
+        if not addr:
+            c.out(f"{self.host} does not resolve - nothing to scan", "bad")
+            return
+        ports = dict(SCAN_PORTS)
+        if self.port:
+            ports.setdefault(self.port, "monitored port")
+        c.out(f"{len(ports)} common TCP ports on {addr}, all at once", "dim")
+        with ThreadPoolExecutor(max_workers=len(ports)) as pool:
+            found = list(zip(sorted(ports), pool.map(lambda p: probe_port(addr, p), sorted(ports))))
+        states = [state for _, (state, _, _) in found]
+        for port, (state, ms, banner) in found:
+            if state == "open":
+                c.segs((f"{port:>6}/tcp  ", "key"), ("open  ", "val"), (f"{ports[port]:<17}", "val"),
+                       (core.fmt_rtt(ms).rjust(7), "dim"), (f"  {banner}" if banner else "", "dim"))
+        opened, closed = states.count("open"), states.count("closed")
+        if not opened:
+            c.out("no open port among these", "warn")
+        c.out(f"{opened} open, {closed} closed (the host refuses), "
+              f"{states.count('filtered')} without answer (firewall or offline)",
+              "val" if opened or closed else "warn")
+
+    def mtu(self):
+        c = self.tools
+        c.section(f"MTU  {datetime.now():%H:%M:%S}")
+        addr = self.address(socket.AF_INET)
+        if not addr:
+            c.out("the MTU search works over IPv4 only, and this host has no IPv4 address"
+                  if self.address() else f"{self.host} does not resolve", "warn")
+            return
+        c.out(f"pings to {addr} with Don't Fragment set, payload + 28 bytes IP/ICMP header", "dim")
+
+        def report(size, ok):
+            c.segs((f"{size:>6} + 28 = {size + 28:<5}", "key"),
+                   ("  fits" if ok else "  too big or no reply", "val" if ok else "warn"))
+        mtu = find_mtu(addr, report)
+        if mtu is None:
+            c.out("no echo reply at all - the MTU search needs a host that answers ping", "bad")
+            return
+        note = MTU_NOTES.get(mtu) or ("1500 is not getting through: a VPN, tunnel or PPPoE "
+                                      "on the way adds its own header" if mtu < 1500 else "")
+        c.kv("Path MTU", f"{mtu} bytes" + (f"  ({note})" if note else ""), "val")
+        c.kv("TCP MSS", f"{mtu - 40} bytes (MTU minus 40 bytes IP/TCP header)")
+
+
+def desktop_area(root):
+    """(x, y, width, height) of all monitors together; Tk only knows the primary one."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            m = ctypes.windll.user32.GetSystemMetrics
+            return m(76), m(77), m(78), m(79)       # SM_X/Y/CX/CYVIRTUALSCREEN
+        except (OSError, AttributeError):
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+class MiniBar(tk.Toplevel):
+    """Mini mode: a small borderless always-on-top list in place of the main window.
+    Drag it anywhere; double-click a host or the caption button for the full window."""
+
+    STRIP = 12          # pings shown per host
+
+    def __init__(self, app):
+        super().__init__(app.root, bg=FACE, bd=2, relief="raised")
+        self.app = app
+        self.size = None
+        self.drag = None
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+
+        self.cap = tk.Frame(self, bg=NAVY)
+        self.cap.pack(fill="x")
+        self.caption = tk.Label(self.cap, text=APP, bg=NAVY, fg="white", font=app.ui_bold,
+                                anchor="w", padx=3)
+        self.caption.pack(side="left", fill="x", expand=True)
+        btn = tk.Canvas(self.cap, width=16, height=14, highlightthickness=0, bg=FACE)
+        btn.pack(side="right", padx=2, pady=2)
+        bevel(btn, 0, 0, 16, 14)
+        for x0, y0 in ((6, 2), (3, 5)):        # Win9x "restore" glyph: two stacked windows
+            btn.create_rectangle(x0, y0, x0 + 6, y0 + 5, fill=FACE, outline=DARK)
+            btn.create_line(x0, y0 + 1, x0 + 7, y0 + 1, fill=DARK)
+        btn.bind("<ButtonRelease-1>", lambda e: app.show_window())
+
+        self.canvas = tk.Canvas(self, bg=SCREEN, highlightthickness=0, bd=0)
+        self.canvas.pack(padx=1, pady=1)
+        for w in (self.cap, self.caption, self.canvas):
+            w.bind("<ButtonPress-1>", self.grab)
+            w.bind("<B1-Motion>", self.move)
+            w.bind("<ButtonRelease-1>", lambda e: app.persist())
+            w.bind("<Button-3>", self.context)
+        self.caption.bind("<Double-Button-1>", lambda e: app.show_window())
+        self.canvas.bind("<Double-Button-1>", self.open_host)
+        self.menu = tk.Menu(self)
+        self.menu.add_command(label=f"Restore {APP}", command=app.show_window)
+        self.menu.add_separator()
+        self.menu.add_command(label="Exit", command=app.quit)
+
+        self.rows = []
+        self.draw(getattr(app, "items", []))
+        self.update_idletasks()
+        x0, y0, dw, dh = desktop_area(app.root)
+        pos = app.settings.get("mini_pos")
+        if not (pos and x0 <= pos[0] < x0 + dw - 40 and y0 <= pos[1] < y0 + dh - 20):
+            pos = (app.root.winfo_screenwidth() - self.winfo_reqwidth() - 24, 80)  # top right
+        self.geometry(f"+{pos[0]}+{pos[1]}")
+
+    def grab(self, event):
+        self.drag = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+
+    def move(self, event):
+        if self.drag:
+            x, y = event.x_root - self.drag[0], event.y_root - self.drag[1]
+            self.geometry(f"+{x}+{y}")
+            self.app.settings["mini_pos"] = [x, y]
+
+    def context(self, event):
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def open_host(self, event):
+        i = int(event.y // self.row_h)
+        if 0 <= i < len(self.rows):
+            self.app.selected = self.rows[i]
+        self.app.show_window()
+
+    def draw(self, items):
+        app, c = self.app, self.canvas
+        f = app.small_mono
+        cw, self.row_h = f.measure("0"), f.metrics("linespace") + 3
+        self.rows = [h for h, _ in items]
+        hostw = min(max([len(h) for h in self.rows] + [12]), 24)
+        x_host, x_rtt = 16, 16 + (hostw + 8) * cw      # RTT is right-aligned at x_rtt
+        width = x_rtt + 8 + self.STRIP * 4 + 4
+        height = max(len(items), 1) * self.row_h + 2
+        if (width, height) != self.size:
+            self.size = (width, height)
+            c.config(width=width, height=height)
+        c.delete("all")
+        for i, (host, t) in enumerate(items):
+            top = i * self.row_h + 1
+            mid = top + self.row_h // 2
+            status, fg = app.status_of(host, t)
+            c.create_oval(5, mid - 4, 13, mid + 4, fill=fg, outline=DARK)
+            name = host if len(host) <= hostw else host[:hostw - 2] + ".."
+            c.create_text(x_host, mid, text=name, anchor="w", font=f, fill=fg)
+            c.create_text(x_rtt, mid, text=t["rtt"] if t["up"] else status, anchor="e", font=f,
+                          fill=fg)
+            seen = [up for up, _ in app.samples.get(host, ())][-self.STRIP:]
+            x = x_rtt + 8 + (self.STRIP - len(seen)) * 4
+            for ok in seen:
+                c.create_rectangle(x, top + 3, x + 2, top + self.row_h - 3,
+                                   fill=DIMGREEN if ok else RED, outline="")
+                x += 4
+        if not items:
+            c.create_text(6, self.row_h // 2 + 1, text="no targets", anchor="w", font=f,
+                          fill=DIMGREEN)
+        down = sum(1 for h, _ in items if app.alarm.get(h))     # counted as in the main title
+        up = sum(1 for h, t in items if t["up"] is not None and not app.alarm.get(h))
+        bg = DIMRED if down else NAVY       # the caption turns red while a host is down
+        self.cap.config(bg=bg)
+        self.caption.config(bg=bg, text=f"{APP}  {up}/{len(items)} up"
+                                        + (f"  {down} DOWN" if down else ""))
+
 
 class App:
     def __init__(self, root, server=None):
@@ -1145,6 +1487,7 @@ class App:
         self.resolver = ThreadPoolExecutor(max_workers=8)
         self.info_windows = {}      # host -> open HostInfo window
         self.rows = []              # host order as drawn
+        self.mini = None            # MiniBar while in mini mode
 
         root.title(f"{APP} - Network Monitor")
         root.configure(bg=FACE)
@@ -1197,7 +1540,9 @@ class App:
         if st["autostart"] and autostart_get() != launch_command():
             autostart_set(True)     # exe was moved: point the Run entry at the new path
             self.log("autostart entry updated to this program's location", AMBER)
-        if "--autostart" in sys.argv and st["start_minimized"] and self.tray:
+        if st["mini"]:      # quit in mini mode last time
+            self.enter_mini()
+        elif "--autostart" in sys.argv and st["start_minimized"] and self.tray:
             root.withdraw()
         if "--updated" in sys.argv:
             self.log(f"updated to version {VERSION}", AMBER)
@@ -1220,6 +1565,12 @@ class App:
         t = tk.Menu(m)
         t.add_command(label="Add Target", underline=0, accelerator="Ctrl+N",
                       command=self.focus_entry)
+        pr = tk.Menu(t)
+        pr.add_command(label="Internet (Cloudflare, Google, Quad9)", underline=0,
+                       command=lambda: self.add_preset("Internet"))
+        pr.add_command(label="Local Network (Gateway, DNS)", underline=0,
+                       command=lambda: self.add_preset("Local Network"))
+        t.add_cascade(label="Add Preset", underline=4, menu=pr)
         t.add_command(label="Sweep Network...", underline=0, accelerator="Ctrl+S",
                       command=self.ask_sweep)
         t.add_separator()
@@ -1247,6 +1598,8 @@ class App:
                                value=ms, command=self.set_slow)
         v.add_cascade(label="Slow Threshold (yellow)", underline=0, menu=sl)
         v.add_separator()
+        v.add_command(label="Mini Mode", underline=0, accelerator="Ctrl+M",
+                      command=self.enter_mini)
         v.add_checkbutton(label="Always on Top", underline=0, variable=self.on_top,
                           command=self.apply_top)
         v.add_checkbutton(label="Beep on Host Down", underline=0, variable=self.beep,
@@ -1303,6 +1656,7 @@ class App:
             ToolButton(inner, self.icons[icon], text, cmd).pack(side="left")
         tk.Frame(inner, width=2, bd=1, relief="sunken").pack(side="left", fill="y", padx=6)
         ToolButton(inner, self.icons["lookup"], "Info", self.host_info).pack(side="left")
+        ToolButton(inner, self.icons["mini"], "Mini", self.enter_mini).pack(side="left")
         ToolButton(inner, self.icons["top"], "On Top", self.toggle_top).pack(side="left")
         ToolButton(inner, self.icons["info"], "About",
                    lambda: AboutDialog(self)).pack(side="left")
@@ -1380,6 +1734,7 @@ class App:
         r.bind("<Delete>", lambda e: None if e.widget is self.entry else self.remove_selected())
         r.bind("<Control-n>", lambda e: self.focus_entry())
         r.bind("<Control-s>", lambda e: self.ask_sweep())
+        r.bind("<Control-m>", lambda e: self.enter_mini())
         r.bind("<Control-c>", lambda e: None if e.widget is self.entry else self.copy_selected())
         r.bind("<Up>", lambda e: self.move_sel(-1))
         r.bind("<Down>", lambda e: self.move_sel(1))
@@ -1414,6 +1769,23 @@ class App:
         core.save()
         if nets:
             SweepDialog(self, nets)
+
+    def add_preset(self, name):
+        entries = local_preset() if name == "Local Network" else PRESETS[name]
+        if not entries:
+            self.flash("Found neither a default gateway nor a DNS server.")
+            return
+        added = 0
+        for host, why in entries:
+            if ":" in host and not local_address(host):    # a target that could only be DOWN
+                self.log(f"{host} left out - this PC has no IPv6 route", GREY)
+            elif core.add(host):
+                added += 1
+                self.log(f"{host:<16} added - {why}", DIMGREEN)
+        core.save()
+        self.flash(f"{name} preset: {added} target(s) added"
+                   + (f", {len(entries) - added} skipped or already listed." if added < len(entries)
+                      else "."))
 
     def ask_sweep(self):
         d = Dialog(self.root, "Sweep Network")
@@ -1575,6 +1947,7 @@ class App:
             return
         menu = pystray.Menu(
             pystray.MenuItem(f"Open {APP}", lambda: self.events.put("show"), default=True),
+            pystray.MenuItem("Mini Mode", lambda: self.events.put("mini")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda: self.events.put("quit")))
         try:
@@ -1618,7 +1991,22 @@ class App:
         else:
             self.quit()
 
+    def enter_mini(self):
+        if not self.mini:
+            self.mini = MiniBar(self)
+            self.root.withdraw()
+            self.settings["mini"] = True
+            self.persist()
+
+    def close_mini(self):
+        if self.mini:
+            self.mini.destroy()
+            self.mini = None
+            self.settings["mini"] = False
+            self.persist()
+
     def show_window(self):
+        self.close_mini()
         self.root.deiconify()
         self.root.state("normal")
         self.root.lift()
@@ -1730,6 +2118,8 @@ class App:
                 return
             if ev == "show":
                 self.show_window()
+            elif ev == "mini":
+                self.enter_mini()
             elif ev[0] == "update":
                 self.log(f"version {ev[1].lstrip('vV')} is available - Help > Check for Updates",
                          AMBER)
@@ -1758,6 +2148,8 @@ class App:
         if self.root.state() != "withdrawn":    # hidden in the tray: only the status matters
             self.draw_list()
             self.draw_graph()
+        if self.mini:
+            self.mini.draw(items)
         self.update_status()
         self.root.after(REFRESH_MS, self.tick)
 
