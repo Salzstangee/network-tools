@@ -1045,7 +1045,7 @@ class HostInfo(tk.Toplevel):
         self.host, self.port = core.split_port(target)
         self.proc = None
         self.trace_stop = threading.Event()
-        self.namer = ThreadPoolExecutor(max_workers=4)     # hop names, resolved beside the trace
+        self.namer = ThreadPoolExecutor(max_workers=4)     # hop names and a ping, beside the trace
         self.tools_used = False
         self.title(f"Host Info - {target}")
         self.transient(app.root)    # stays above an always-on-top PingMon, hides with it
@@ -1245,6 +1245,12 @@ class HostInfo(tk.Toplevel):
         except (OSError, UnicodeError):
             pass
 
+    def answers_ping(self):
+        try:
+            return any(core.echo(self.host, timeout=2)[0] for _ in range(2))
+        except Exception:
+            return False
+
     def trace_route(self):
         c = self.route
         c.out(f"{datetime.now():%H:%M:%S}  route to {self.host}", "head")
@@ -1266,6 +1272,9 @@ class HostInfo(tk.Toplevel):
         except OSError as e:
             c.out(f"could not start {cmd[0]}: {e}", "bad")
             return
+        # routers that never answer a trace are common inside networks; a target that answers
+        # pings is reached in the end, so only a trace to a silent host gives up early
+        answers = self.namer.submit(self.answers_ping)
         dead, last = 0, None
         for n, line in enumerate(self.proc.stdout):
             line = line.rstrip()
@@ -1284,9 +1293,11 @@ class HostInfo(tk.Toplevel):
                     self.namer.submit(self.hop_name, c, n, found[-1])
                 continue
             dead += 1
-            if dead >= self.DEAD_HOPS:      # an offline host would leave 30 hops of timeouts
+            # an offline host would leave 30 hops of timeouts
+            if dead >= self.DEAD_HOPS and not answers.result():
                 self.proc.kill()
-                c.out(f"{dead} hops in a row without any reply - stopped.", "warn")
+                c.out(f"{dead} hops in a row without any reply and {self.host} does not "
+                      f"answer pings - stopped.", "warn")
                 c.out(f"The route ends after hop {last[0]} ({last[1]})." if last
                       else "Not even the first hop answered.", "warn")
                 break
