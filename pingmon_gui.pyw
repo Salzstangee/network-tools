@@ -1678,7 +1678,7 @@ class App:
         # target list
         top = tk.Frame(pane, bg=FACE, bd=2, relief="sunken")
         self.list = tk.Canvas(top, bg=SCREEN, highlightthickness=0, bd=0)
-        sb = tk.Scrollbar(top, orient="vertical", command=self.list.yview)
+        sb = tk.Scrollbar(top, orient="vertical", command=self.list_yview)
         self.list.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.list.pack(side="left", fill="both", expand=True)
@@ -1686,9 +1686,9 @@ class App:
         self.list.bind("<Button-3>", self.on_context)
         self.list.bind("<Double-Button-1>", lambda e: self.row_at(e.y) and self.host_info())
         self.list.bind("<MouseWheel>",
-                       lambda e: self.list.yview_scroll(-e.delta // 120, "units"))
-        self.list.bind("<Button-4>", lambda e: self.list.yview_scroll(-1, "units"))
-        self.list.bind("<Button-5>", lambda e: self.list.yview_scroll(1, "units"))
+                       lambda e: self.list_yview("scroll", -e.delta // 120, "units"))
+        self.list.bind("<Button-4>", lambda e: self.list_yview("scroll", -1, "units"))
+        self.list.bind("<Button-5>", lambda e: self.list_yview("scroll", 1, "units"))
         pane.add(top, minsize=120, stretch="always")
 
         # graph + event log side by side, each in a classic group box
@@ -2059,6 +2059,14 @@ class App:
         self.root.destroy()
 
     # ---- list interaction ----------------------------------------------
+
+    def list_yview(self, *args):
+        self.list.yview(*args)
+        # when all rows fit, Tk still lets the canvas scroll up past its top,
+        # which opens an empty gap under the header
+        if self.list.canvasy(0) < 0:
+            self.list.yview_moveto(0)
+        self.draw_list()    # move the header and draw the rows that just came into view
 
     def row_at(self, y):
         i = int((self.list.canvasy(y) - self.header_h) // self.row_h)
