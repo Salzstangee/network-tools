@@ -17,7 +17,6 @@ import socket
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -380,21 +379,20 @@ def latest_release():
     return url.rstrip("/").rsplit("/", 1)[1]
 
 
-def update_script(new_name, name):
-    """cmd script that swaps the downloaded exe in once PingMon has exited, then starts it.
-
-    A running exe can't be overwritten, so the move retries until the old process is gone.
-    """
-    q = lambda s: s.replace("%", "%%")
-    lines = ["@echo off", "set n=0", ":retry",
-             f'move /y "{q(new_name)}" "{q(name)}" >nul 2>&1 && goto ok',
-             "set /a n+=1", "if %n% geq 30 goto fail",
-             "ping -n 2 127.0.0.1 >nul",       # 1s sleep; timeout.exe refuses to run without a console
-             "goto retry",
-             ":ok", f'start "" "{q(name)}" --updated', "goto end",
-             ":fail", f'start "" "{q(name)}"',
-             ":end", '(goto) 2>nul & del "%~f0"']
-    return "\r\n".join(lines) + "\r\n"
+def install_update(new_file, exe=sys.executable):
+    """Put the downloaded exe in place of the running one, which Windows lets us rename but not
+    overwrite: ours steps aside as <exe>.old. No helper cmd script, Defender took that for a trojan."""
+    old = exe + ".old"
+    try:
+        os.remove(old)      # a leftover the last update could not delete
+    except FileNotFoundError:
+        pass
+    os.replace(exe, old)
+    try:
+        os.replace(new_file, exe)
+    except OSError:
+        os.replace(old, exe)
+        raise
 
 
 def clean_env():
@@ -409,14 +407,18 @@ def clean_env():
             and not (mei and k.upper() in ("TCL_LIBRARY", "TK_LIBRARY") and v.startswith(mei))}
 
 
-def stage_update(new_file):
-    folder, name = os.path.split(sys.executable)
-    script = os.path.join(tempfile.gettempdir(), "pingmon_update.cmd")
-    with open(script, "w", encoding="oem", newline="") as fh:   # cmd reads the OEM codepage
-        fh.write(update_script(os.path.basename(new_file), name))
-    subprocess.Popen(["cmd", "/c", script], cwd=folder, env=clean_env(), stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     creationflags=0x08000000)    # CREATE_NO_WINDOW
+def drop_old_exe(exe=sys.executable, tries=40):
+    """Delete the <exe>.old an update left; it stays locked until the old PingMon has exited."""
+    old = exe + ".old"
+    for _ in range(tries):
+        try:
+            os.remove(old)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
 
 
 def tray_image(alert):
@@ -724,14 +726,14 @@ class UpdateDialog(Dialog):
 
     def on_downloaded(self, path):
         try:
-            stage_update(path)
-        except (OSError, UnicodeError) as e:
+            install_update(path)
+        except OSError as e:
             self.on_error("Update failed", f"Could not install the new version:\n{e}")
             return
         self.title_lbl.config(text=f"Restarting {APP}...")
         self.info_lbl.config(text="The new version starts in a moment.")
         self.buttons()
-        self.after(500, self.app.quit)
+        self.after(500, self.app.restart)
 
     def on_error(self, title, text):
         if self.cancel.is_set():
@@ -1564,6 +1566,8 @@ class App:
             root.withdraw()
         if "--updated" in sys.argv:
             self.log(f"updated to version {VERSION}", AMBER)
+        if SELF_UPDATE:
+            threading.Thread(target=drop_old_exe, daemon=True).start()
         if st["check_updates"]:
             threading.Thread(target=self.quiet_update_check, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2075,6 +2079,20 @@ class App:
         if self.server:
             self.server.close()
         self.root.destroy()
+
+    def restart(self):
+        """Start the exe an update just put in place, then quit."""
+        if self.server:     # free the single-instance port, or the new one would only show us
+            self.server.close()
+            self.server = None
+        try:
+            subprocess.Popen([sys.executable, "--updated"], cwd=os.path.dirname(sys.executable),
+                             env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError as e:
+            messagebox.showerror(APP, f"The update is installed, but {APP} could not restart:\n{e}\n\n"
+                                      f"Start {APP} again by hand.", parent=self.root)
+        self.quit()
 
     # ---- list interaction ----------------------------------------------
 

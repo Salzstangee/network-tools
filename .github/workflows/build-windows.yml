@@ -221,6 +221,69 @@ jobs:
           except Exception:
               annotate("error", traceback.format_exc()[-1500:])
               sys.exit(1)
+      - name: Smoke test the self-update swap and restart
+        shell: python
+        run: |
+          import importlib.machinery, importlib.util, os, shutil, socket, subprocess, sys, tempfile, time, traceback
+          import tkinter as tk
+          os.environ["USERPROFILE"] = tempfile.mkdtemp()      # settings and targets of a fresh user
+          sys.path.insert(0, ".")
+
+          def annotate(level, msg):     # annotations are readable through the API, logs are not
+              msg = str(msg).encode("ascii", "replace").decode()
+              print(f"::{level}::" + msg.replace("%", "%25").replace("\n", "%0A"), flush=True)
+
+          def answers(wait=45):
+              end = time.time() + wait
+              while time.time() < end:
+                  try:
+                      with socket.create_connection(("127.0.0.1", gui.INSTANCE_PORT), timeout=2) as c:
+                          c.sendall(b"pingmon-show\n")
+                          if c.recv(16).startswith(b"ok"):
+                              return True
+                  except OSError:
+                      time.sleep(1)
+              return False
+
+          def kill(pid=None):
+              target = ["/PID", str(pid)] if pid else ["/IM", "PingMon.exe"]
+              subprocess.run(["taskkill", "/F", "/T"] + target, capture_output=True)
+              time.sleep(3)
+
+          try:
+              loader = importlib.machinery.SourceFileLoader("gui", "pingmon_gui.pyw")
+              gui = importlib.util.module_from_spec(importlib.util.spec_from_loader("gui", loader))
+              loader.exec_module(gui)
+              exe = os.path.join(tempfile.mkdtemp(), "PingMon.exe")
+              shutil.copy(r"dist\PingMon.exe", exe)
+              shutil.copy(r"dist\PingMon.exe", exe + ".new")
+              running = subprocess.Popen([exe], env=gui.clean_env())
+              assert answers(), "PingMon.exe in the test folder did not start"
+              gui.install_update(exe + ".new", exe)        # what Update Now does, with the exe running
+              assert os.path.exists(exe + ".old") and not os.path.exists(exe + ".new"), os.listdir(os.path.dirname(exe))
+              kill(running.pid)
+
+              # the hand-over of App.restart(), with this process as the old PingMon
+              gui.pystray = None
+              server = gui.claim_instance()
+              assert server, "single-instance port is not free"
+              root = tk.Tk()
+              app = gui.App(root, server)
+              sys.executable = exe
+              app.restart()
+              ok = answers()
+              end = time.time() + 15
+              while os.path.exists(exe + ".old") and time.time() < end:
+                  time.sleep(0.5)
+              dropped = not os.path.exists(exe + ".old")
+              kill()
+              annotate("notice" if ok and dropped else "error",
+                       f"self-update: swap with PingMon running ok; restart with --updated "
+                       f"{'answers' if ok else 'does not answer'}; .old {'deleted' if dropped else 'left behind'}")
+              os._exit(0 if ok and dropped else 1)
+          except Exception:
+              annotate("error", traceback.format_exc()[-1500:])
+              os._exit(1)
       - uses: actions/upload-artifact@v4
         with:
           name: PingMon
