@@ -70,6 +70,99 @@ jobs:
           print(f"::notice::MTU to loopback: {mtu}")
           assert mtu in (1500, 9000), mtu
           print("gui ok", gui.VERSION, gui.dns_name("127.0.0.1"))
+      - name: Smoke test the window refresh with a real Tk
+        shell: python
+        run: |
+          import importlib.machinery, importlib.util, os, sys, tempfile, time, tkinter as tk, traceback
+          os.environ["USERPROFILE"] = tempfile.mkdtemp()      # own settings and targets, not the exe test's
+          sys.path.insert(0, ".")
+
+          def annotate(level, msg):     # annotations are readable through the API, logs are not
+              msg = str(msg).encode("ascii", "replace").decode()
+              print(f"::{level}::" + msg.replace("%", "%25").replace("\n", "%0A"), flush=True)
+
+          try:
+              loader = importlib.machinery.SourceFileLoader("gui", "pingmon_gui.pyw")
+              gui = importlib.util.module_from_spec(importlib.util.spec_from_loader("gui", loader))
+              loader.exec_module(gui)
+              gui.pystray = None
+              errors = []
+              root = tk.Tk()
+              root.report_callback_exception = lambda *exc: errors.append(exc)
+              app = gui.App(root)
+              real = {"list": app.draw_list, "graph": app.draw_graph}
+              draws = dict.fromkeys(real, 0)
+              def counted(name):
+                  def draw():
+                      draws[name] += 1
+                      real[name]()
+                  return draw
+              app.draw_list, app.draw_graph = counted("list"), counted("graph")
+              for i in range(1, 11):
+                  gui.core.add(f"127.0.0.{i}")
+
+              def run(secs):
+                  end = time.time() + secs
+                  while time.time() < end:
+                      root.update()
+                      time.sleep(0.01)
+
+              def samples():
+                  return app.counts.get("127.0.0.1", 0)
+
+              run(3)      # layout, DNS names and first samples settle
+              n0, d0 = samples(), dict(draws)
+              run(5)
+              n, dl, dg = samples() - n0, draws["list"] - d0["list"], draws["graph"] - d0["graph"]
+              assert n >= 3 and 0 < dl <= 2 * n + 2 and 0 < dg <= 2 * n + 2, ("steady", n, dl, dg)
+
+              d = dict(draws)
+              app.slow_ms.set(20)
+              app.set_slow()
+              run(0.6)
+              assert draws["list"] > d["list"] and draws["graph"] > d["graph"], "slow threshold"
+
+              for hide, state in ((root.withdraw, "withdrawn"), (root.iconify, "iconic")):
+                  hide()
+                  run(0.5)
+                  assert root.state() == state, (state, root.state())
+                  d, before = dict(draws), samples()
+                  run(2.5)
+                  assert draws == d and samples() > before, (f"drawn while {state}", d, draws)
+                  root.deiconify()
+                  run(0.6)
+                  assert draws["list"] > d["list"], f"not redrawn after {state}"
+
+              app.enter_mini()
+              run(0.3)
+              m, painted, mini_draw = app.mini, [], app.mini.draw
+              def watched(items):
+                  old = m.drawn
+                  mini_draw(items)
+                  painted.append(m.drawn is not old)
+              m.draw = watched
+              run(3)
+              assert 0 < sum(painted) < len(painted), ("mini", painted)
+              app.show_window()
+              run(0.5)
+
+              assert root.title().startswith("PingMon - 10/10 up"), root.title()
+              assert app.status["up"].cget("text") == "10 up", app.status["up"].cget("text")
+              assert not errors, "".join(traceback.format_exception(*errors[0]))
+
+              t = time.perf_counter()
+              for _ in range(20):
+                  real["list"]()
+                  real["graph"]()
+                  root.update_idletasks()
+              paint = (time.perf_counter() - t) / 20 * 1000
+              annotate("notice", f"refresh: 10 targets, 5 s: {n} samples, list drawn {dl}x, graph {dg}x "
+                                 f"(before: one each per tick, ~20x); one paint of both {paint:.1f} ms")
+              app.quit()
+          except Exception:
+              annotate("error", traceback.format_exc()[-1500:])
+              os._exit(1)
+          os._exit(0)
       - run: pyinstaller --onefile --windowed --name PingMon --icon pingmon.ico --hidden-import pystray._win32 pingmon_gui.pyw
       - name: Smoke test the exe, also as restarted by an update
         shell: python

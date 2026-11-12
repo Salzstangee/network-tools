@@ -1382,6 +1382,7 @@ class MiniBar(tk.Toplevel):
         self.app = app
         self.size = None
         self.drag = None
+        self.drawn = None       # what the list showed when last drawn
         self.overrideredirect(True)
         self.attributes("-topmost", True)
 
@@ -1441,6 +1442,10 @@ class MiniBar(tk.Toplevel):
 
     def draw(self, items):
         app, c = self.app, self.canvas
+        key = (tuple((h, t["checked"]) for h, t in items), app.slow_ms.get())
+        if key == self.drawn:
+            return
+        self.drawn = key
         f = app.small_mono
         cw, self.row_h = f.measure("0"), f.metrics("linespace") + 3
         self.rows = [h for h, _ in items]
@@ -1498,6 +1503,8 @@ class App:
         self.resolver = ThreadPoolExecutor(max_workers=8)
         self.info_windows = {}      # host -> open HostInfo window
         self.rows = []              # host order as drawn
+        self.items = []             # (host, target) snapshot of the last tick
+        self.list_key = self.graph_key = None   # what list and graph showed when last drawn
         self.mini = None            # MiniBar while in mini mode
 
         root.title(f"{APP} - Network Monitor")
@@ -2077,7 +2084,7 @@ class App:
         # which opens an empty gap under the header
         if self.list.canvasy(0) < 0:
             self.list.yview_moveto(0)
-        self.draw_list()    # move the header and draw the rows that just came into view
+        self.refresh()      # move the header and draw the rows that just came into view
 
     def row_at(self, y):
         i = int((self.list.canvasy(y) - self.header_h) // self.row_h)
@@ -2088,13 +2095,13 @@ class App:
         host = self.row_at(event.y)
         if host:
             self.selected = host
-            self.draw_list()
+            self.refresh()
 
     def on_context(self, event):
         host = self.row_at(event.y)
         if host:
             self.selected = host
-            self.draw_list()
+            self.refresh()
             self.ctx.tk_popup(event.x_root, event.y_root)
 
     def move_sel(self, delta):
@@ -2102,7 +2109,7 @@ class App:
             return
         i = self.rows.index(self.selected) if self.selected in self.rows else -1
         self.selected = self.rows[max(0, min(len(self.rows) - 1, i + delta))]
-        self.draw_list()
+        self.refresh()
 
     # ---- log / status ---------------------------------------------------
 
@@ -2164,13 +2171,27 @@ class App:
         if self.selected not in live:
             self.selected = items[0][0] if items else None
         self.items = items
-        if self.root.state() != "withdrawn":    # hidden in the tray: only the status matters
-            self.draw_list()
-            self.draw_graph()
+        self.refresh()
         if self.mini:
             self.mini.draw(items)
         self.update_status()
         self.root.after(REFRESH_MS, self.tick)
+
+    def refresh(self):
+        """Redraw list and graph, each only if something it shows changed: samples come
+        once per interval, ticks four times a second."""
+        if self.root.state() in ("withdrawn", "iconic"):    # tray or taskbar: only the status matters
+            return
+        items, sel, slow, c, g = self.items, self.selected, self.slow_ms.get(), self.list, self.graph
+        key = (tuple((h, t["checked"]) for h, t in items), tuple(self.names.get(h) for h, _ in items),
+               sel, slow, c.winfo_width(), c.winfo_height(), c.canvasy(0))
+        if key != self.list_key:
+            self.list_key = key
+            self.draw_list()
+        key = (sel, self.counts.get(sel), slow, g.winfo_width(), g.winfo_height())
+        if key != self.graph_key:
+            self.graph_key = key
+            self.draw_graph()
 
     def resolve(self, host):
         self.names[host] = dns_name(host)
@@ -2233,16 +2254,20 @@ class App:
         s = self.status
         if not s["msg"].cget("text"):
             s["msg"].config(text="Ready - Target box takes IPs, hostnames, host:port or CIDRs")
-        s["targets"].config(text=f"{len(items)} targets")
-        s["up"].config(text=f"{up} up")
-        s["down"].config(text=f"{down} down", fg="#a00000" if down else "black")
-        s["loss"].config(text=f"Lost {lost}/{sent} ({core.pct(lost, sent)})")
-        s["interval"].config(text=f"Interval {core.INTERVAL:g}s")
-        s["clock"].config(text=datetime.now().strftime("%H:%M:%S"))
+        for key, opts in (("targets", {"text": f"{len(items)} targets"}),
+                          ("up", {"text": f"{up} up"}),
+                          ("down", {"text": f"{down} down", "fg": "#a00000" if down else "black"}),
+                          ("loss", {"text": f"Lost {lost}/{sent} ({core.pct(lost, sent)})"}),
+                          ("interval", {"text": f"Interval {core.INTERVAL:g}s"}),
+                          ("clock", {"text": datetime.now().strftime("%H:%M:%S")})):
+            changed = {k: v for k, v in opts.items() if s[key].cget(k) != v}
+            if changed:     # Tk repaints a widget on every configure, even with the same text
+                s[key].config(**changed)
         title = f"{APP} - {up}/{len(items)} up"
         if down:
             title += f" - {down} DOWN"
-        self.root.title(title)
+        if self.root.title() != title:      # Windows repaints caption and taskbar button on each set
+            self.root.title(title)
         if self.tray and (bool(down), title) != self.tray_state:
             self.tray_state = (bool(down), title)
             self.tray.icon = tray_image(bool(down))
